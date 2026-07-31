@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
+_pyinstaller/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

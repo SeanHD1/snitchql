@@ -1,0 +1,4 @@
+# SnitchQL runtime dependencies (what the .exe actually imports).
+# The GUI/runtime uses ONLY PyQt6 + the Python standard library.
+# (construct, rich, pandas, openpyxl, pyodbc are dev/optional and NOT bundled.)
+PyQt6>=6.4
