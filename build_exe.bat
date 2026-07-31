@@ -48,23 +48,34 @@ if errorlevel 1 (
 )
 
 REM --- place the exe next to a data folder so auto-load works (dbsys-like) ---
-set OUT_EXE=
-if exist "dist\SnitchQL.exe" set "OUT_EXE=dist\SnitchQL.exe"
-if exist "dist\SnitchQL\SnitchQL.exe" set "OUT_EXE=dist\SnitchQL\SnitchQL.exe"
-
-if defined OUT_EXE (
-    if exist "All Dats" (
-        copy /Y "%OUT_EXE%" "All Dats\SnitchQL.exe" >nul
-        echo [OK] Copied exe -> All Dats\SnitchQL.exe  (auto-loads this folder)
-    ) else if exist "Data" (
-        copy /Y "%OUT_EXE%" "Data\SnitchQL.exe" >nul
-        echo [OK] Copied exe -> Data\SnitchQL.exe  (auto-loads this folder)
+REM PyInstaller may emit either dist\SnitchQL.exe (onefile) or
+REM dist\SnitchQL\SnitchQL.exe (onedir). Locate it robustly.
+set "OUT_EXE="
+for /r "dist" %%F in (SnitchQL.exe) do (
+    if exist "%%F" set "OUT_EXE=%%F"
+)
+REM Fallback: if PyInstaller reported success but we didn't find it, list dist.
+if not defined OUT_EXE (
+    if exist "dist" (
+        echo [!] Build reported success but exe not found at expected path.
+        echo     Contents of dist\:
+        dir /b "dist" 2>nul
     ) else (
-        echo [OK] Built: %OUT_EXE%
-        echo      (No "All Dats"/"Data" folder found here, so it won't auto-load.
-        echo       Use "Set Data Dir..." in the app, or drop the exe next to your data.)
+        echo [!] Build produced no exe - see output above.
     )
+    pause
+    exit /b 1
+)
+
+if exist "All Dats" (
+    copy /Y "%OUT_EXE%" "All Dats\SnitchQL.exe" >nul
+    echo [OK] Copied exe -> All Dats\SnitchQL.exe  (auto-loads this folder)
+) else if exist "Data" (
+    copy /Y "%OUT_EXE%" "Data\SnitchQL.exe" >nul
+    echo [OK] Copied exe -> Data\SnitchQL.exe  (auto-loads this folder)
 ) else (
-    echo [!] Build produced no exe - see output above.
+    echo [OK] Built: %OUT_EXE%
+    echo      (No "All Dats"/"Data" folder found here, so it won't auto-load.
+    echo       Use "Set Data Dir..." in the app, or drop the exe next to your data.)
 )
 pause
