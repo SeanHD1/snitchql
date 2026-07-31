@@ -44,6 +44,7 @@ _TYPE_INFO = {
     5: ("ShortInt", 2),
     6: ("Integer", 4),
     7: ("Double", 8),
+    10: ("Time", 4),          # 4-byte LE seconds since midnight
     11: ("Timestamp", 8),
     5383: ("Currency", 8),
     7430: ("AutoInc", 4),
@@ -122,6 +123,15 @@ def _decode(raw: bytes, col: Column):
         if d <= 0:
             return None
         return (_DBISAM_EPOCH + timedelta(days=d - 1)).isoformat()
+    if t == 10:  # Time (milliseconds since midnight)
+        ms = struct.unpack_from("<I", raw[:4])[0]
+        if ms >= 86400000:   # out of range (a day = 86,400,000 ms) -> raw number
+            return ms
+        h = ms // 3600000
+        rem = ms % 3600000
+        m = rem // 60000
+        s = (rem % 60000) // 1000
+        return f"{h:02d}:{m:02d}:{s:02d}"
     if t == 11:  # Timestamp
         ms = struct.unpack_from("<d", raw[:8])[0]
         if ms <= 0 or ms < 24 * 60 * 60 * 1000:

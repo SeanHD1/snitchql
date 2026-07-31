@@ -15,7 +15,7 @@ Run:  python -m snitchql.gui   (auto-loads the All Dats dir if present)
 import os
 import sys
 from pathlib import Path
-
+from PyQt6.QtCore import QDir
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QTableWidget, QTableWidgetItem, QLineEdit,
@@ -51,13 +51,54 @@ def _app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+# --- persisted config (remembers the user's chosen data dir) ---
+def _config_path() -> Path:
+    """snitchql.ini next to the real exe (works frozen + from source)."""
+    if getattr(sys, "frozen", False):
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(1024)
+            ctypes.windll.kernel32.GetModuleFileNameW(0, buf, 1024)
+            return Path(buf.value).parent / "snitchql.ini"
+        except Exception:
+            return Path(sys.executable).parent / "snitchql.ini"
+    return Path(__file__).resolve().parent / "snitchql.ini"
+
+
+def _load_data_dir() -> str:
+    p = _config_path()
+    if p.is_file():
+        d = p.read_text().strip()
+        if d and Path(d).is_dir():
+            return d
+    return ""
+
+
+def _save_data_dir(d: str):
+    try:
+        _config_path().write_text(d)
+    except Exception:
+        pass
+
+
 # Auto-load the "All Dats" folder if it sits next to the executable, otherwise
-# fall back to the executable's own directory.
+# fall back to the executable's own directory. A previously chosen data dir
+# (via "Set Data Dir...") is remembered in snitchql.ini and takes priority.
 _APP_DIR = _app_dir()
-if (_APP_DIR / "All Dats").is_dir():
+_remembered = _load_data_dir()
+if _remembered:
+    DEFAULT_DIR = _remembered
+elif (_APP_DIR / "All Dats").is_dir():
     DEFAULT_DIR = str(_APP_DIR / "All Dats")
 else:
     DEFAULT_DIR = str(_APP_DIR)
+
+# Light-mode QSS. Soft light-green alternating rows (no eye-searing blue), and a
+# gentle tint for the grid. Dark mode (DARK_QSS) overrides this when toggled on.
+LIGHT_QSS = """
+QTableWidget { alternate-background-color: #e8f3ec; gridline-color: #d0d0d0; }
+QHeaderView::section { background-color: #eef2f0; color: #222; }
+"""
 
 # Dark-mode QSS. Applied via app.setStyleSheet; empty string restores default
 # (light) styling. Kept self-contained so there is no external theme dependency.
@@ -425,6 +466,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("SnitchQL — DBISAM Explorer")
         self.resize(1400, 800)
+        # Start in light mode with the soft-green alternating rows.
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(LIGHT_QSS)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -507,16 +552,20 @@ class MainWindow(QMainWindow):
         pane.populate(t.rows)
 
     def on_set_dir(self):
-        global DEFAULT_DIR
-        d = QFileDialog.getExistingDirectory(self, "Select data directory", DEFAULT_DIR)
+        # No preset default: start at "This PC" so the user must consciously
+        # choose. The chosen directory is remembered in snitchql.ini.
+        d = QFileDialog.getExistingDirectory(
+            self, "Select data directory", QDir.rootPath())
         if d:
+            global DEFAULT_DIR
             DEFAULT_DIR = d
+            _save_data_dir(d)
 
     def on_dark(self, on):
-        """Toggle the dark-mode QSS. Off => default light styling."""
+        """Toggle the dark-mode QSS. Off => light styling (soft green alternation)."""
         app = QApplication.instance()
         if app is not None:
-            app.setStyleSheet(DARK_QSS if on else "")
+            app.setStyleSheet(DARK_QSS if on else LIGHT_QSS)
         self.dark_btn.setText("☀ Light" if on else "🌙 Dark")
 
     def on_layout(self, dual):

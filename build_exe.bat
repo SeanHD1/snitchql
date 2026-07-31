@@ -40,7 +40,10 @@ set SPEC=snitchql.spec
 if /I "%~1"=="--onedir" set SPEC=snitchql_onedir.spec
 
 echo [*] Building SnitchQL (spec: %SPEC%) ...
-pyinstaller %SPEC% --noconfirm --clean
+REM --runtime-tmpdir . => the one-file exe extracts next to itself (a local
+REM path) instead of a temp dir. This avoids failures when the exe is launched
+REM from a network/UNC share (\\server\share) on a client machine.
+pyinstaller %SPEC% --noconfirm --clean --runtime-tmpdir .
 if errorlevel 1 (
     echo [!] Build failed - see output above.
     pause
@@ -65,6 +68,16 @@ if not defined OUT_EXE (
     )
     pause
     exit /b 1
+)
+
+REM --- bundle the VC++ redistributable if you dropped it next to the build ---
+REM PyQt6 (Qt) requires the Microsoft Visual C++ 2019+ Runtime. PyInstaller
+REM usually bundles it when present on the BUILD machine, but a bare Windows
+REM Server often lacks it. Ship vc_redist.x64.exe alongside the exe so the
+REM client just double-clicks it once (no scripts, no admin scripts needed).
+if exist "vc_redist.x64.exe" (
+    copy /Y "vc_redist.x64.exe" "%OUT_EXE%.vc_redist.x64.exe" >nul
+    echo [OK] Bundled vc_redist.x64.exe next to the exe (client runs it once if needed).
 )
 
 if exist "All Dats" (
