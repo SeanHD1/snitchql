@@ -63,6 +63,11 @@ On first launch SnitchQL opens with **no preset data directory** — use
 ## Status
 - Reader, GUI, filter builder, compare, schema, blobs, dark mode: working.
 - Time (type 10) and Date/Timestamp columns decoded to HH:MM:SS / dates.
+- Edit mode: tick "✎ Edit Mode" to edit String cells; edits stage and require a
+  confirm dialog before writing. Each write is guarded (aborts if the on-disk
+  value doesn't match) and a `.dat.bak` backup is made first. v1 edits String
+  columns only — numeric/BLOB/AutoInc are read-only until the row-offset model
+  for those types is cross-verified against pydbisam. Test on a COPY first.
 - Index (`.idx`) verify: CONSISTENT on v4 integer indexes; other index
   versions report UNKNOWN honestly (no false corruption verdicts). Rebuild
   not yet implemented.

@@ -87,7 +87,7 @@ class Column:
         if self.native_size > 0:
             return self.native_size
         if self.native_size == 0:       # string
-            return max(self.length, 1) + 1   # +1 leading tag byte
+            return max(self.length, 1)  # data length (marker byte is separate, at row_offset-1)
         return max(self.length, 1)      # opaque
 
 
@@ -106,8 +106,8 @@ class Table:
 def _decode(raw: bytes, col: Column):
     t = col.type_id
     if t == 1:  # String
-        # row_offset already skips the leading tag byte (+1 at parse time),
-        # so raw is pure text + trailing NULs.
+        # row_offset points at the first data byte (the marker/presence byte
+        # sits one byte before, at row_offset-1). Raw is pure text + NULs.
         s = raw.rstrip(b"\x00").decode("cp1252", "replace")
         return s
     if t == 4:  # Boolean
@@ -174,7 +174,7 @@ def read_table(path: str, include_deleted: bool = False) -> Table:
         name = raw_name.decode("latin-1", "replace").split("\x00", 1)[0].strip()
         type_id = mv[base + 0xA4]
         length = struct.unpack_from("<H", mv, base + 0xA6)[0]
-        row_off = struct.unpack_from("<H", mv, base + 0xAC)[0] + 1  # +1: def points at tag byte; data follows
+        row_off = struct.unpack_from("<H", mv, base + 0xAC)[0] + 1  # +1: def offset points at the marker/presence byte; data follows
         columns.append(Column(fidx, name, type_id, length, row_off))
 
     # rows flat from data_offset
@@ -189,13 +189,12 @@ def read_table(path: str, include_deleted: bool = False) -> Table:
         ok = True
         for col in columns:
             off = pos + col.row_offset
+            pres = mv[pos + col.row_offset - 1]
             n = col.read_size
             raw = mv[off: off + n]
             if len(raw) < n:
                 ok = False
                 break
-            # presence byte sits just before the data (at row_offset - 1)
-            pres = mv[pos + col.row_offset - 1] if (pos + col.row_offset - 1) >= 0 else 0
             if pres == 0:
                 # field absent/empty -> match pydbisam semantics
                 row[col.name] = "" if col.type_id == 1 else None
@@ -210,9 +209,11 @@ def read_table(path: str, include_deleted: bool = False) -> Table:
                 deleted += 1
                 if include_deleted:
                     row["__deleted__"] = True
+                    row["__phys_off__"] = pos  # physical offset (incl. deleted)
                     rows.append(row)
             else:
                 seen_live += 1
+                row["__phys_off__"] = pos  # physical offset of this live row
                 rows.append(row)
         pos += row_size
 
@@ -223,6 +224,133 @@ def read_table(path: str, include_deleted: bool = False) -> Table:
         user_version=f"{uv_major}.{uv_minor}",
         description=description,
     )
+
+
+# ---------------------------------------------------------------------------
+# Editing support (EXPERIMENTAL — verify on a copy before touching live data)
+# ---------------------------------------------------------------------------
+# SAFE-SCOPE v1: only String columns are editable. Their byte layout has been
+# byte-for-byte verified against pydbisam (the reference reader). Numeric, Date,
+# Time, Timestamp, Boolean, BLOB and AutoInc columns are intentionally read-only
+# in this build because their row offsets in multi-type rows have not yet been
+# cross-verified against pydbisam — editing them risks corrupting a client DB.
+# Numeric editing will follow once the row-offset model is reconciled.
+EDITABLE_TYPES = {1}
+
+
+def _encode(value, col: Column):
+    """Encode a Python value back to the on-disk bytes for ``col``.
+
+    Returns (field_bytes, presence_byte) where presence_byte is 0 if the field
+    should be written as absent/empty, else 1. Raises ValueError on bad input.
+    """
+    t = col.type_id
+    # empty / null
+    if value is None or value == "":
+        if t == 1:
+            return b"\x00" * col.length, 0   # all-NUL data; presence=0 marks absent
+        return b"\x00" * col.width, 0
+
+    if t == 1:  # String
+        if not isinstance(value, str):
+            value = str(value)
+        raw = value.encode("cp1252", "replace")
+        if len(raw) > col.length:
+            raise ValueError(f"value too long for {col.name} (max {col.length})")
+        buf = bytearray(col.length)
+        buf[0:len(raw)] = raw   # data starts at byte 0; trailing NULs already zero
+        return bytes(buf), 1
+
+    if t == 4:  # Boolean
+        b = 1 if value else 0
+        return bytes([b]), 1
+
+    if t == 5:  # ShortInt
+        return struct.pack("<h", int(value)), 1
+
+    if t == 6 or t == 7430:  # Integer / AutoInc
+        return struct.pack("<i", int(value)), 1
+
+    if t == 7 or t == 5383:  # Double / Currency
+        return struct.pack("<d", float(value)), 1
+
+    if t == 2:  # Date (ISO yyyy-mm-dd)
+        d = datetime.strptime(value, "%Y-%m-%d").date()
+        days = (d - _DBISAM_EPOCH).days + 1
+        return struct.pack("<i", days), 1
+
+    if t == 10:  # Time (HH:MM:SS)
+        h, m, s = (int(x) for x in value.split(":"))
+        ms = ((h * 60 + m) * 60 + s) * 1000
+        return struct.pack("<I", ms), 1
+
+    if t == 11:  # Timestamp (ISO yyyy-mm-ddTHH:MM:SS)
+        dt = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
+        ms = (dt - _DBISAM_EPOCH).total_seconds() * 1000 + 1
+        return struct.pack("<d", ms), 1
+
+    raise ValueError(f"type {col.type_name} is not editable")
+
+
+def row_phys_offset(table: Table, row_index: int) -> int:
+    """Absolute file offset of the *physical* row backing live row ``row_index``.
+
+    DBISAM keeps deleted rows in place (they are not removed from the file), so
+    the i-th *live* row is NOT at data_offset + i*row_size. The reader records
+    each row's true physical offset in ``__phys_off__``; we use that so writes
+    never land on the wrong (possibly deleted) row.
+    """
+    row = table.rows[row_index]
+    if "__phys_off__" in row:
+        return row["__phys_off__"]
+    # Fallback for tables read without offset tracking.
+    data_offset = 0x200 + len(table.columns) * 768
+    return data_offset + row_index * table.row_size
+
+
+def read_cell(path: str, table: Table, row_index: int, col: Column):
+    """Read the current decoded value of a cell directly from disk.
+
+    Used by the verify-before-write guard: we confirm the bytes at the target
+    offset currently hold the value the user is editing before we overwrite
+    them, so a wrong row mapping aborts instead of corrupting data.
+    """
+    off = row_phys_offset(table, row_index) + col.row_offset
+    with open(path, "rb") as f:
+        f.seek(off - 1)
+        pres = f.read(1)[0]
+        raw = f.read(col.read_size)
+    if pres == 0:
+        return "" if col.type_id == 1 else None
+    return _decode(raw, col)
+
+
+def write_cell(path: str, table: Table, row_index: int, col: Column, value,
+               expected_current=None) -> int:
+    """In-place patch of a single cell. Returns bytes written.
+
+    SAFE: only the changed field's bytes + its presence byte are rewritten; the
+    rest of the file is untouched. If ``expected_current`` is given, the cell is
+    first re-read from disk and compared to it — a mismatch means our row
+    mapping is off, so we refuse to write (abort) rather than corrupt the wrong
+    row. The write targets the row's *physical* offset, so deleted rows in the
+    file do not shift the target. Caller is responsible for backup + confirm.
+    """
+    if expected_current is not None:
+        actual = read_cell(path, table, row_index, col)
+        if actual != expected_current:
+            raise ValueError(
+                f"row-mapping guard tripped: cell at row {row_index}, "
+                f"col {col.name!r} currently holds {actual!r}, expected "
+                f"{expected_current!r}. Refusing to write to avoid corruption.")
+    field_bytes, presence = _encode(value, col)
+    off = row_phys_offset(table, row_index) + col.row_offset
+    with open(path, "r+b") as f:
+        f.seek(off)
+        f.write(field_bytes)
+        f.seek(off - 1)          # presence byte sits just before the data
+        f.write(bytes([presence]))
+    return len(field_bytes)
 
 
 if __name__ == "__main__":

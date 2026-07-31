@@ -26,6 +26,7 @@ from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QColor, QAction
 
 from snitchql import query as query_mod
+from snitchql.reader import EDITABLE_TYPES
 
 
 def _app_dir() -> Path:
@@ -275,9 +276,13 @@ class Pane(QWidget):
         self.schema_btn.clicked.connect(self.show_schema)
         self.blob_btn.clicked.connect(self.show_blobs)
         self.filter_edit.textChanged.connect(self.apply_filters)
+        self.grid.cellChanged.connect(self._on_cell_changed)
 
         self._all_rows = []   # full decoded rows
         self._display_rows = []
+        self._edit_mode = False
+        # staged edits: dict[(row_index, col_name)] = original_value
+        self._staged = {}
 
     # ---- schema viewer ----
     def show_schema(self):
@@ -402,6 +407,7 @@ class Pane(QWidget):
         if t is None:
             return
         cols = t.columns
+        self.grid.blockSignals(True)  # don't fire cellChanged while we build rows
         self.grid.setColumnCount(len(cols))
         self.grid.setHorizontalHeaderLabels([c.name for c in cols])
         self.grid.setRowCount(len(rows))
@@ -409,11 +415,78 @@ class Pane(QWidget):
             for ci, col in enumerate(cols):
                 val = row.get(col.name)
                 item = QTableWidgetItem("" if val is None else str(val))
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if self._edit_mode and col.type_id in EDITABLE_TYPES:
+                    # String columns only in v1 (byte-verified against pydbisam).
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+                else:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                # mark non-editable columns subtly when in edit mode
+                if self._edit_mode and col.type_id not in EDITABLE_TYPES:
+                    item.setForeground(QColor(150, 150, 150))
                 self.grid.setItem(ri, ci, item)
         self.grid.resizeColumnsToContents()
+        self.grid.blockSignals(False)
         self.rows_lbl.setText(f"{len(rows)} shown")
         self._display_rows = rows
+
+    def set_edit_mode(self, on: bool):
+        """Toggle edit mode: enable/disable String-cell editing and reset staging."""
+        self._edit_mode = on
+        if not on:
+            self._staged.clear()
+        # Re-apply editability to currently displayed rows without losing data.
+        self.populate(self._display_rows)
+
+    def _on_cell_changed(self, ri, ci):
+        if not self._edit_mode:
+            return
+        if self.table is None:
+            return
+        col = self.table.columns[ci]
+        if col.type_id not in EDITABLE_TYPES:
+            return
+        item = self.grid.item(ri, ci)
+        if item is None:
+            return
+        new_val = item.text()
+        # Map displayed row -> source row index in self.table.rows. The displayed
+        # rows are the SAME dict objects as in self.table.rows (live view), so an
+        # identity lookup gives the correct logical index (survives filtering).
+        try:
+            row_index = self.table.rows.index(self._display_rows[ri])
+        except (ValueError, IndexError):
+            return
+        original = self.table.rows[row_index].get(col.name)
+        if new_val == ("" if original is None else str(original)):
+            # reverted to original -> unstage (and restore stored value)
+            self._staged.pop((row_index, col.name), None)
+        else:
+            # stage: remember original, and update the in-memory row so Save
+            # writes the edited value.
+            self._staged[(row_index, col.name)] = original
+            self.table.rows[row_index][col.name] = new_val
+        self._update_save_button()
+
+    def _update_save_button(self):
+        n = len(self._staged)
+        mw = self.window()
+        if hasattr(mw, "save_btn"):
+            mw.save_btn.setText(f"Save Changes ({n})")
+            mw.save_btn.setEnabled(n > 0)
+
+    def _silent_reopen(self):
+        """Re-read the current file from disk and repopulate (post-write refresh)."""
+        if not self.path:
+            return
+        from snitchql.reader import read_table
+        try:
+            t = read_table(self.path)
+        except Exception:
+            return
+        self.table = t
+        self._all_rows = t.rows
+        self.builder.set_fields([c.name for c in t.columns])
+        self.populate(t.rows)
 
     def apply_filters(self):
         if self.table is None:
@@ -489,9 +562,17 @@ class MainWindow(QMainWindow):
         self.dark_btn.toggled.connect(self.on_dark)
         self.dir_btn = QPushButton("Set Data Dir…")
         self.dir_btn.clicked.connect(self.on_set_dir)
+        self.edit_btn = QPushButton("✎ Edit Mode")
+        self.edit_btn.setCheckable(True)
+        self.edit_btn.toggled.connect(self.on_edit_mode)
+        self.save_btn = QPushButton("Save Changes (0)")
+        self.save_btn.setEnabled(False)
+        self.save_btn.clicked.connect(self.on_save_changes)
         top.addWidget(QLabel("SnitchQL"))
         top.addStretch(1)
         top.addWidget(self.dir_btn)
+        top.addWidget(self.edit_btn)
+        top.addWidget(self.save_btn)
         top.addWidget(self.layout_btn)
         top.addWidget(self.dark_btn)
         top.addWidget(self.compare_btn)
@@ -560,6 +641,71 @@ class MainWindow(QMainWindow):
             global DEFAULT_DIR
             DEFAULT_DIR = d
             _save_data_dir(d)
+
+    def on_edit_mode(self, on):
+        """Enable/disable string-cell editing in both panes. Off by default."""
+        self.edit_btn.setText("✎ Edit Mode ●" if on else "✎ Edit Mode")
+        for pane in (self.pane_a, self.pane_b):
+            pane.set_edit_mode(on)
+
+    def on_save_changes(self):
+        """Collect staged edits from both panes, confirm, then write with backup.
+
+        Safety: each file is backed up to <name>.dat.bak before any write; every
+        cell write is guarded by its current on-disk value (write_cell aborts if
+        the row mapping is off). Writes only String columns (v1, byte-verified).
+        """
+        from snitchql.reader import write_cell
+        staged = []  # (pane, row_index, col, original)
+        total = 0
+        for pane in (self.pane_a, self.pane_b):
+            for (ri, cname), orig in pane._staged.items():
+                col = next(c for c in pane.table.columns if c.name == cname)
+                new_val = pane.table.rows[ri].get(cname)
+                staged.append((pane, ri, col, orig))
+                total += 1
+        if not staged:
+            return
+        # Build a readable summary
+        lines = []
+        for pane, ri, col, orig in staged:
+            new_val = pane.table.rows[ri].get(col.name)
+            lines.append(f"  • {Path(pane.path).name}  row {ri+1}, {col.name}:\n"
+                         f"      {orig!r}  →  {new_val!r}")
+        msg = (f"About to write {total} change(s) to live .dat file(s).\n\n"
+               + "\n".join(lines)
+               + "\n\nA backup (.bak) will be made first. This cannot be undone "
+                 "from inside SnitchQL. Continue?")
+        ans = QMessageBox.question(self, "Confirm write to disk", msg,
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        written = 0
+        errors = []
+        for pane, ri, col, orig in staged:
+            try:
+                # backup once per file
+                bak = Path(pane.path).with_suffix(".dat.bak")
+                if not bak.exists():
+                    bak.write_bytes(Path(pane.path).read_bytes())
+                new_val = pane.table.rows[ri].get(col.name)
+                write_cell(pane.path, pane.table, ri, col, new_val,
+                           expected_current=orig)
+                written += 1
+            except Exception as e:
+                errors.append(f"{col.name} row {ri+1}: {e}")
+        if errors:
+            QMessageBox.critical(self, "Write errors",
+                                 "Some edits were NOT written:\n\n" + "\n".join(errors))
+        else:
+            QMessageBox.information(self, "Saved",
+                                    f"Wrote {written} change(s). Backup saved as .bak.")
+        # refresh both panes from disk
+        for pane in (self.pane_a, self.pane_b):
+            if pane.path:
+                pane._silent_reopen()
+        self.edit_btn.setChecked(False)
+        self.on_edit_mode(False)
 
     def on_dark(self, on):
         """Toggle the dark-mode QSS. Off => light styling (soft green alternation)."""
