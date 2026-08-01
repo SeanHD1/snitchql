@@ -35,6 +35,7 @@ a = Analysis(
         "snitchql.gui",
         "snitchql.blob",
         "snitchql.index",
+        "snitchql.tablemodel",
         "PyQt6.QtWidgets",
         "PyQt6.QtGui",
         "PyQt6.QtCore",

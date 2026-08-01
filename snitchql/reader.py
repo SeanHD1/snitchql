@@ -292,6 +292,53 @@ def _encode(value, col: Column):
     raise ValueError(f"type {col.type_name} is not editable")
 
 
+def read_table_meta(path: str):
+    """Cheap header-only scan: columns + counts, NO row decoding.
+
+    Used by the GUI's auto-load picker so it can survey hundreds of .dat
+    files without paying the cost of decoding every row. Returns a dict:
+        {columns, total_rows, row_size, user_version, description}
+    """
+
+    def _column_from_block(mv, base):
+        if base + 0xB0 > len(mv):
+            return None
+        fidx = struct.unpack_from("<H", mv, base)[0]
+        raw_name = bytes(mv[base + 0x02: base + 0x02 + 162]).rstrip(b"\x00")
+        if raw_name[:1] < b"\x20":
+            raw_name = raw_name[1:]
+        name = raw_name.decode("latin-1", "replace").split("\x00", 1)[0].strip()
+        type_id = mv[base + 0xA4]
+        length = struct.unpack_from("<H", mv, base + 0xA6)[0]
+        row_off = struct.unpack_from("<H", mv, base + 0xAC)[0] + 1
+        return Column(fidx, name, type_id, length, row_off)
+
+    with open(path, "rb") as f:
+        # Read just the header + field-def area; rows come later so we can
+        # skip them entirely.
+        head = f.read(0x200)
+        if len(head) < 0x30:
+            return dict(columns=[], total_rows=0, row_size=0,
+                        user_version="", description="")
+        total_fields = struct.unpack_from("<H", head, 0x2F)[0]
+        field_bytes = f.read(total_fields * 768)
+    mv = memoryview(head + field_bytes)
+    uv_major = struct.unpack_from("<H", mv, 0xC1)[0]
+    uv_minor = mv[0xC3]
+    desc_len = mv[0x47]
+    description = bytes(mv[0x48:0x48 + desc_len]).rstrip(b"\x00").decode("cp1252", "replace")
+    columns = []
+    for i in range(total_fields):
+        col = _column_from_block(mv, 0x200 + i * 768)
+        if col is None:
+            break
+        columns.append(col)
+    total_rows = struct.unpack_from("<I", mv, 0x29)[0]
+    row_size = struct.unpack_from("<H", mv, 0x2D)[0]
+    return dict(columns=columns, total_rows=total_rows, row_size=row_size,
+                user_version=f"{uv_major}.{uv_minor}", description=description)
+
+
 def row_phys_offset(table: Table, row_index: int) -> int:
     """Absolute file offset of the *physical* row backing live row ``row_index``.
 

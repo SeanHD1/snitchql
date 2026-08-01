@@ -3,30 +3,40 @@
 
 Features (M2):
   * Open up to two .dat files side-by-side (max 2, per spec).
-  * Each pane: schema-aware table view, row count, filter box.
+  * Each pane: schema-aware virtual table view (only visible cells are
+    materialised, so 400k-row tables render instantly), filter box, filter
+    builder, compare, schema, blob, export.
   * "Compare" toggles a row-diff highlight between the two panes
     (key-based: highlights rows present in one but not the other on the
     first column treated as key; visual only).
   * Export current pane to CSV/JSON.
 Desktop-only target (Windows). Pure PyQt6 + stdlib.
 
-Run:  python -m snitchql.gui   (auto-loads the All Dats dir if present)
+Performance note (P0 fix):
+  File reads happen on a background QThread (ReaderThread); the table itself
+  is a virtual QAbstractTableModel (RowTableModel) fronted by a
+  QSortFilterProxyModel (RowProxyModel). The GUI thread is therefore never
+  blocked by either decoding a 500 MB file or building cell widgets, which
+  eliminates the "not responding" hangs on open, Edit Mode, and post-save
+  refresh.
 """
 import os
 import sys
 from pathlib import Path
-from PyQt6.QtCore import QDir
+from PyQt6.QtCore import QDir, Qt, QSize, QModelIndex
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QFileDialog, QTableWidget, QTableWidgetItem, QLineEdit,
-    QLabel, QComboBox, QMessageBox, QHeaderView, QSplitter, QMenu,
-    QInputDialog, QFrame, QDialog, QListWidget, QTextEdit,
+    QPushButton, QFileDialog, QLineEdit, QLabel, QComboBox, QMessageBox,
+    QHeaderView, QSplitter, QMenu, QInputDialog, QFrame, QDialog,
+    QListWidget, QTextEdit, QTableView, QTableWidget, QTableWidgetItem,
 )
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QColor, QAction
+from PyQt6.QtGui import QColor
 
 from snitchql import query as query_mod
 from snitchql.reader import EDITABLE_TYPES
+from snitchql.tablemodel import (
+    RowTableModel, RowProxyModel, ReaderThread, _CMP_BLOCK, _CMP_PRESENT,
+)
 
 
 def _app_dir() -> Path:
@@ -35,8 +45,8 @@ def _app_dir() -> Path:
     For a PyInstaller one-file build the app unpacks to a temp dir at runtime,
     so ``sys.executable`` points at the temp copy, not the real on-disk exe.
     On Windows we ask the OS for the true module path via GetModuleFileNameW;
-    elsewhere we use the script/executable path. This is what "All Dats next
-    to the exe" should resolve against.
+    elsewhere we use the script/executable path. This is what the auto-load
+    folder should resolve against.
     """
     if getattr(sys, "frozen", False):
         if sys.platform.startswith("win"):
@@ -48,7 +58,6 @@ def _app_dir() -> Path:
             except Exception:
                 return Path(sys.executable).parent
         return Path(sys.executable).parent
-    # Running from source: use this file's real location.
     return Path(__file__).resolve().parent
 
 
@@ -82,9 +91,9 @@ def _save_data_dir(d: str):
         pass
 
 
-# Auto-load the "All Dats" folder if it sits next to the executable, otherwise
-# fall back to the executable's own directory. A previously chosen data dir
-# (via "Set Data Dir...") is remembered in snitchql.ini and takes priority.
+# Auto-load folder resolution. A previously chosen data dir (via "Set Data
+# Dir...") is remembered in snitchql.ini and takes priority. Otherwise, if an
+# "All Dats" folder sits next to the exe we use that; else the exe's own dir.
 _APP_DIR = _app_dir()
 _remembered = _load_data_dir()
 if _remembered:
@@ -97,7 +106,7 @@ else:
 # Light-mode QSS. Soft light-green alternating rows (no eye-searing blue), and a
 # gentle tint for the grid. Dark mode (DARK_QSS) overrides this when toggled on.
 LIGHT_QSS = """
-QTableWidget { alternate-background-color: #e8f3ec; gridline-color: #d0d0d0; }
+QTableView { alternate-background-color: #e8f3ec; gridline-color: #d0d0d0; }
 QHeaderView::section { background-color: #eef2f0; color: #222; }
 """
 
@@ -108,12 +117,12 @@ QWidget { background-color: #2b2b2b; color: #e0e0e0; }
 QMainWindow, QDialog { background-color: #2b2b2b; }
 QPushButton { background-color: #3a3a3a; color: #e0e0e0; border: 1px solid #555; padding: 4px 8px; }
 QPushButton:checked { background-color: #4a6fa5; color: #ffffff; }
-QLineEdit, QComboBox, QTableWidget { background-color: #1f1f1f; color: #e0e0e0; gridline-color: #444; }
+QLineEdit, QComboBox, QTableView { background-color: #1f1f1f; color: #e0e0e0; gridline-color: #444; alternate-background-color: #333333; }
 QHeaderView::section { background-color: #3a3a3a; color: #e0e0e0; }
-QTableWidget { alternate-background-color: #333333; }
 QMenu { background-color: #2b2b2b; color: #e0e0e0; }
 QLabel { color: #e0e0e0; }
 QSplitter::handle { background-color: #444; }
+QListWidget, QTextEdit { background-color: #1f1f1f; color: #e0e0e0; }
 """
 
 
@@ -185,7 +194,6 @@ class FilterBuilder(QWidget):
 
     def set_fields(self, fields):
         self.fields = list(fields)
-        # rebuild any existing rows with the new field list
         for row in self.rule_rows:
             cur = row.field.currentText()
             row.field.clear()
@@ -219,11 +227,11 @@ class FilterBuilder(QWidget):
 
 
 class Pane(QWidget):
-    """One table viewer pane."""
+    """One virtual-table viewer pane."""
 
     def __init__(self, title, parent=None):
         super().__init__(parent)
-        self.table = None          # snitchql Table
+        self.table = None
         self.path = None
         self.layout = QVBoxLayout(self)
 
@@ -237,6 +245,8 @@ class Pane(QWidget):
         self.schema_btn = QPushButton("Schema")
         self.blob_btn = QPushButton("Blob")
         self.schema_lbl = QLabel("")
+        self.path_lbl = QLabel("")           # full path under the db name
+        self.path_lbl.setStyleSheet("color: #888; font-size: 10px;")
         bar.addWidget(self.title)
         bar.addStretch(1)
         bar.addWidget(self.schema_lbl)
@@ -246,10 +256,11 @@ class Pane(QWidget):
         bar.addWidget(self.export_csv)
         bar.addWidget(self.export_json)
         self.layout.addLayout(bar)
+        self.layout.addWidget(self.path_lbl)
 
         # filter
         fbar = QHBoxLayout()
-        fbar.addWidget(QLabel("Quick:"))
+        fbar.addWidget(QLabel("Quick Filter:"))
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("substring across all columns")
         fbar.addWidget(self.filter_edit)
@@ -262,27 +273,82 @@ class Pane(QWidget):
         self.builder.apply_btn.clicked.connect(self.apply_filters)
         self.layout.addWidget(self.builder)
 
-        # table
-        self.grid = QTableWidget()
+        # virtual table
+        self.grid = QTableView()
         self.grid.setAlternatingRowColors(True)
         self.grid.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Interactive)
         self.grid.setSortingEnabled(True)
+        self.grid.setSelectionBehavior(
+            QTableView.SelectionBehavior.SelectRows)
         self.layout.addWidget(self.grid)
+
+        # model stack: RowTableModel -> RowProxyModel -> QTableView
+        self.model = RowTableModel(self)
+        self.proxy = RowProxyModel(self)
+        self.proxy.setSourceModel(self.model)
+        self.grid.setModel(self.proxy)
 
         self.open_btn.clicked.connect(self.on_open)
         self.export_csv.clicked.connect(lambda: self.on_export("csv"))
         self.export_json.clicked.connect(lambda: self.on_export("json"))
         self.schema_btn.clicked.connect(self.show_schema)
         self.blob_btn.clicked.connect(self.show_blobs)
-        self.filter_edit.textChanged.connect(self.apply_filters)
-        self.grid.cellChanged.connect(self._on_cell_changed)
+        self.filter_edit.textChanged.connect(self._on_quick_typed)
 
-        self._all_rows = []   # full decoded rows
-        self._display_rows = []
+        self._all_rows = []   # full decoded rows (== self.table.rows)
+        self._hays = []       # precomputed lowercase search haystack
         self._edit_mode = False
-        # staged edits: dict[(row_index, col_name)] = original_value
-        self._staged = {}
+        self._loader = None   # active background ReaderThread
+
+    # ---- async open ----
+    def _open_async(self, path):
+        """Kick off a background read. The GUI stays responsive the whole time."""
+        # If a load is already in flight for this pane, stop it cleanly so we
+        # don't leak a running QThread (and so it can't deliver stale rows).
+        old = self._loader
+        if old is not None:
+            try:
+                old.loaded.disconnect()
+                old.failed.disconnect()
+            except Exception:
+                pass
+            if old.isRunning():
+                old.quit()
+                old.wait(2000)
+            old.deleteLater()
+        self.title.setText(f"Loading… {Path(path).name}")
+        self.schema_lbl.setText("")
+        self.path_lbl.setText("")
+        self.rows_lbl.setText("")
+        self._loader = ReaderThread(path)
+        self._loader.loaded.connect(self._on_loaded)
+        self._loader.failed.connect(self._on_load_failed)
+        self._loader.start()
+
+    def _on_loaded(self, table, hays):
+        if self.sender() is not self._loader:
+            return  # a newer load superseded this one
+        self.path = self._loader.path
+        self.table = table
+        self._all_rows = table.rows
+        self._hays = hays
+        self.model.set_table(table, hays)
+        self.proxy.setSourceModel(self.model)
+        self.builder.set_fields([c.name for c in table.columns])
+        self.title.setText(Path(self.path).name)
+        self.path_lbl.setText(self.path)
+        self.schema_lbl.setText(f"{len(table.columns)} cols · {table.total_rows} rows")
+        # re-apply any pending quick/structured filters
+        self.apply_filters(silent=True)
+        self.on_edit_staged(0)
+
+    def _on_load_failed(self, msg):
+        if self.sender() is not self._loader:
+            return
+        QMessageBox.critical(self, "Error",
+                             f"Failed to read {self._loader.path}:\n{msg}")
+        self.title.setText("Table")
 
     # ---- schema viewer ----
     def show_schema(self):
@@ -302,9 +368,6 @@ class Pane(QWidget):
         tbl.setAlternatingRowColors(True)
         for ri, c in enumerate(cols):
             type_name = getattr(c, "type_name", None) or f"id{c.type_id}"
-            # width = effective byte width (native size for fixed types,
-            # declared length for strings). Show raw length too if it differs,
-            # since DBISAM stores 0 there for fixed-width fields.
             w = c.width
             len_disp = str(w) if w == c.length else f"{w} (raw {c.length})"
             vals = [str(c.index), c.name, str(type_name), len_disp,
@@ -323,12 +386,7 @@ class Pane(QWidget):
 
     # ---- blob viewer ----
     def show_blobs(self):
-        """Open a dialog listing blob records from the sibling .blb file.
-
-        DBISAM stores memo/blob fields in a companion <stem>.blb. We look for a
-        .blb next to the currently-open .dat; if found, parse and show its
-        records (text inline, binary as hex preview + size).
-        """
+        """Open a dialog listing blob records from the sibling .blb file."""
         if not self.path:
             QMessageBox.information(self, "Blobs", "Open a .dat first.")
             return
@@ -360,7 +418,6 @@ class Pane(QWidget):
                         f"{rec['data'][:8].hex()}"
             list_w.addItem(label)
         v.addWidget(list_w)
-        # detail view for selected record
         detail = QTextEdit()
         detail.setReadOnly(True)
         v.addWidget(detail)
@@ -374,7 +431,6 @@ class Pane(QWidget):
                 detail.setPlainText(
                     f"Binary blob, {len(rec['data'])} bytes\n\nHex preview:\n"
                     + rec["data"][:256].hex(" "))
-
         list_w.currentItemChanged.connect(
             lambda cur, _prev: on_sel(cur) if cur else None)
         close = QPushButton("Close")
@@ -382,130 +438,34 @@ class Pane(QWidget):
         v.addWidget(close)
         dlg.exec()
 
-    # ---- loading ----
+    # ---- loading via dialog ----
     def on_open(self):
-        from snitchql.reader import read_table
         path, _ = QFileDialog.getOpenFileName(
             self, "Open DBISAM .dat", DEFAULT_DIR, "DBISAM (*.dat)")
         if not path:
             return
-        try:
-            t = read_table(path)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to read {path}:\n{e}")
-            return
-        self.path = path
-        self.table = t
-        self.title.setText(f"{Path(path).name}")
-        self.schema_lbl.setText(f"{len(t.columns)} cols · {len(t.rows)} rows")
-        self._all_rows = t.rows
-        self.builder.set_fields([c.name for c in t.columns])
-        self.populate(self._all_rows)
+        self._open_async(path)
 
-    def populate(self, rows):
-        t = self.table
-        if t is None:
-            return
-        cols = t.columns
-        self.grid.blockSignals(True)  # don't fire cellChanged while we build rows
-        self.grid.setColumnCount(len(cols))
-        self.grid.setHorizontalHeaderLabels([c.name for c in cols])
-        self.grid.setRowCount(len(rows))
-        for ri, row in enumerate(rows):
-            for ci, col in enumerate(cols):
-                val = row.get(col.name)
-                item = QTableWidgetItem("" if val is None else str(val))
-                if self._edit_mode and col.type_id in EDITABLE_TYPES:
-                    # String columns only in v1 (byte-verified against pydbisam).
-                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-                else:
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                # mark non-editable columns subtly when in edit mode
-                if self._edit_mode and col.type_id not in EDITABLE_TYPES:
-                    item.setForeground(QColor(150, 150, 150))
-                self.grid.setItem(ri, ci, item)
-        self.grid.resizeColumnsToContents()
-        self.grid.blockSignals(False)
-        self.rows_lbl.setText(f"{len(rows)} shown")
-        self._display_rows = rows
+    def apply_filters(self, silent=False):
+        """Push quick + structured filters into the proxy.
 
-    def set_edit_mode(self, on: bool):
-        """Toggle edit mode: enable/disable String-cell editing and reset staging."""
-        self._edit_mode = on
-        if not on:
-            self._staged.clear()
-        # Re-apply editability to currently displayed rows without losing data.
-        self.populate(self._display_rows)
-
-    def _on_cell_changed(self, ri, ci):
-        if not self._edit_mode:
-            return
+        The proxy recomputes accepted rows lazily (only visible cells are
+        touched), so this is instant even on 400k-row tables.
+        """
         if self.table is None:
             return
-        col = self.table.columns[ci]
-        if col.type_id not in EDITABLE_TYPES:
-            return
-        item = self.grid.item(ri, ci)
-        if item is None:
-            return
-        new_val = item.text()
-        # Map displayed row -> source row index in self.table.rows. The displayed
-        # rows are the SAME dict objects as in self.table.rows (live view), so an
-        # identity lookup gives the correct logical index (survives filtering).
-        try:
-            row_index = self.table.rows.index(self._display_rows[ri])
-        except (ValueError, IndexError):
-            return
-        original = self.table.rows[row_index].get(col.name)
-        if new_val == ("" if original is None else str(original)):
-            # reverted to original -> unstage (and restore stored value)
-            self._staged.pop((row_index, col.name), None)
-        else:
-            # stage: remember original, and update the in-memory row so Save
-            # writes the edited value.
-            self._staged[(row_index, col.name)] = original
-            self.table.rows[row_index][col.name] = new_val
-        self._update_save_button()
-
-    def _update_save_button(self):
-        n = len(self._staged)
-        mw = self.window()
-        if hasattr(mw, "save_btn"):
-            mw.save_btn.setText(f"Save Changes ({n})")
-            mw.save_btn.setEnabled(n > 0)
-
-    def _silent_reopen(self):
-        """Re-read the current file from disk and repopulate (post-write refresh)."""
-        if not self.path:
-            return
-        from snitchql.reader import read_table
-        try:
-            t = read_table(self.path)
-        except Exception:
-            return
-        self.table = t
-        self._all_rows = t.rows
-        self.builder.set_fields([c.name for c in t.columns])
-        self.populate(t.rows)
-
-    def apply_filters(self):
-        if self.table is None:
-            return
-        rows = self._all_rows
-        # structured filter builder (AND/OR)
         rules, combine = self.builder.collect()
-        if rules:
-            rows = query_mod.apply_filters(rows, rules, combine=combine)
-        # quick substring on top (AND semantics)
-        q = self.filter_edit.text().strip().lower()
-        if q:
-            out = []
-            for r in rows:
-                hay = " ".join("" if v is None else str(v) for v in r.values()).lower()
-                if q in hay:
-                    out.append(r)
-            rows = out
-        self.populate(rows)
+        self.proxy.set_rules(rules, combine=combine)
+        self.proxy.set_quick(self.filter_edit.text())
+        self.rows_lbl.setText(f"{self.proxy.rowCount()} shown")
+        if not silent:
+            self._restore_scroll_top()
+
+    def _on_quick_typed(self, _text):
+        self.apply_filters(silent=True)
+
+    def _restore_scroll_top(self):
+        self.grid.scrollToTop()
 
     def on_export(self, kind):
         if self.table is None:
@@ -517,7 +477,12 @@ class Pane(QWidget):
             f"{kind.upper()} (*.{ext})")
         if not path:
             return
-        rows = self._display_rows or self._all_rows
+        # Export the *currently displayed* (filtered) rows. Map each proxy row
+        # back to its source row in self.table.rows.
+        rows = []
+        for pr in range(self.proxy.rowCount()):
+            src = self.proxy.mapToSource(self.proxy.index(pr, 0)).row()
+            rows.append(self._all_rows[src])
         with open(path, "w", newline="", encoding="utf-8") as f:
             if kind == "csv":
                 exp.export_csv(self.table, f, rows)
@@ -525,13 +490,37 @@ class Pane(QWidget):
                 exp.export_json(self.table, f, rows)
         QMessageBox.information(self, "Exported", f"Wrote {len(rows)} rows to {path}")
 
-    # ---- compare support ----
-    def key_set(self):
-        """Set of first-column values for quick row-diff."""
-        if not self._display_rows or self.table is None:
+    # ---- edit mode ----
+    def set_edit_mode(self, on: bool):
+        self._edit_mode = on
+        self.model.set_edit_mode(on)
+
+    def on_edit_staged(self, n):
+        """Called by the model's editStaged signal; update MainWindow button."""
+        mw = self.window()
+        if hasattr(mw, "_refresh_save_button"):
+            mw._refresh_save_button()
+
+    def displayed_key_set(self):
+        """Set of first-column values over the currently displayed rows."""
+        if not self.table or not self._all_rows:
             return set()
         key = self.table.columns[0].name
-        return {r.get(key) for r in self._display_rows}
+        keys = set()
+        for pr in range(self.proxy.rowCount()):
+            src = self.proxy.mapToSource(self.proxy.index(pr, 0)).row()
+            keys.add(self._all_rows[src].get(key))
+        return keys
+
+    def compare_state_map(self, other_keys):
+        """Per source-row compare state: block if key in other, else present."""
+        if not self.table:
+            return []
+        key = self.table.columns[0].name
+        return [
+            _CMP_BLOCK if r.get(key) in other_keys else _CMP_PRESENT
+            for r in self._all_rows
+        ]
 
 
 class MainWindow(QMainWindow):
@@ -539,7 +528,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("SnitchQL — DBISAM Explorer")
         self.resize(1400, 800)
-        # Start in light mode with the soft-green alternating rows.
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(LIGHT_QSS)
@@ -550,16 +538,6 @@ class MainWindow(QMainWindow):
 
         # top toolbar
         top = QHBoxLayout()
-        self.compare_btn = QPushButton("Compare ▶")
-        self.compare_btn.setCheckable(True)
-        self.compare_btn.toggled.connect(self.on_compare)
-        self.layout_btn = QPushButton("Layout: Dual ▦")
-        self.layout_btn.setCheckable(True)
-        self.layout_btn.setChecked(True)
-        self.layout_btn.toggled.connect(self.on_layout)
-        self.dark_btn = QPushButton("🌙 Dark")
-        self.dark_btn.setCheckable(True)
-        self.dark_btn.toggled.connect(self.on_dark)
         self.dir_btn = QPushButton("Set Data Dir…")
         self.dir_btn.clicked.connect(self.on_set_dir)
         self.edit_btn = QPushButton("✎ Edit Mode")
@@ -568,6 +546,16 @@ class MainWindow(QMainWindow):
         self.save_btn = QPushButton("Save Changes (0)")
         self.save_btn.setEnabled(False)
         self.save_btn.clicked.connect(self.on_save_changes)
+        self.layout_btn = QPushButton("Layout: Dual ▦")
+        self.layout_btn.setCheckable(True)
+        self.layout_btn.setChecked(True)
+        self.layout_btn.toggled.connect(self.on_layout)
+        self.dark_btn = QPushButton("🌙 Dark")
+        self.dark_btn.setCheckable(True)
+        self.dark_btn.toggled.connect(self.on_dark)
+        self.compare_btn = QPushButton("Compare ▶")
+        self.compare_btn.setCheckable(True)
+        self.compare_btn.toggled.connect(self.on_compare)
         top.addWidget(QLabel("SnitchQL"))
         top.addStretch(1)
         top.addWidget(self.dir_btn)
@@ -586,55 +574,50 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(self.pane_b)
         root.addWidget(self.splitter, 1)
 
-        # try to auto-open two interesting tables
+        # keep Save button in sync with either pane's staging
+        self.pane_a.model.editStaged.connect(
+            lambda _: self._refresh_save_button())
+        self.pane_b.model.editStaged.connect(
+            lambda _: self._refresh_save_button())
+
         self._maybe_autoload()
 
+    def _refresh_save_button(self):
+        n = self.pane_a.model.staged_count() + self.pane_b.model.staged_count()
+        self.save_btn.setText(f"Save Changes ({n})")
+        self.save_btn.setEnabled(n > 0)
+
     def _maybe_autoload(self):
-        # Prefer data-bearing tables so a first run shows real content, not
-        # empty schema-only files. Reading every .dat can be slow (some are
-        # 100k+ rows), so we bound the scan: sample the first N candidates and
-        # pick the two best-populated tables that are small enough to render
-        # snappily. The user can always Open… any other file.
-        from snitchql.reader import read_table
-        candidates = sorted(Path(DEFAULT_DIR).glob("*.dat"))[:200]
-        scored = []  # (rowcount, path)
+        # Cheap header-only scan (read_table_meta) so we never decode every
+        # .dat just to pick the two best demo panes. We score by declared
+        # total_rows and prefer mid-sized tables that render snappily.
+        from snitchql.reader import read_table_meta
+        try:
+            candidates = sorted(Path(DEFAULT_DIR).glob("*.dat"))[:200]
+        except Exception:
+            return
+        scored = []
         for c in candidates:
             try:
-                t = read_table(str(c))
+                meta = read_table_meta(str(c))
             except Exception:
                 continue
-            if len(t.rows) <= 0 or len(t.rows) > 50000:
-                continue  # skip empty and very large tables for the demo panes
-            scored.append((len(t.rows), str(c)))
+            if meta["total_rows"] <= 0 or meta["total_rows"] > 50000:
+                continue
+            scored.append((meta["total_rows"], str(c)))
         scored.sort(reverse=True)
         picked = []
-        for n, p in scored:
+        for _, p in scored:
             if p not in picked:
                 picked.append(p)
             if len(picked) == 2:
                 break
         if len(picked) >= 1:
-            self._silent_open(self.pane_a, picked[0])
+            self.pane_a._open_async(picked[0])
         if len(picked) >= 2:
-            self._silent_open(self.pane_b, picked[1])
-
-    def _silent_open(self, pane, path):
-        from snitchql.reader import read_table
-        try:
-            t = read_table(path)
-        except Exception:
-            return
-        pane.path = path
-        pane.table = t
-        pane.title.setText(Path(path).name)
-        pane.schema_lbl.setText(f"{len(t.columns)} cols · {len(t.rows)} rows")
-        pane._all_rows = t.rows
-        pane.builder.set_fields([c.name for c in t.columns])
-        pane.populate(t.rows)
+            self.pane_b._open_async(picked[1])
 
     def on_set_dir(self):
-        # No preset default: start at "This PC" so the user must consciously
-        # choose. The chosen directory is remembered in snitchql.ini.
         d = QFileDialog.getExistingDirectory(
             self, "Select data directory", QDir.rootPath())
         if d:
@@ -649,42 +632,32 @@ class MainWindow(QMainWindow):
             pane.set_edit_mode(on)
 
     def on_save_changes(self):
-        """Collect staged edits from both panes, confirm, then write with backup.
-
-        Safety: each file is backed up to <name>.dat.bak before any write; every
-        cell write is guarded by its current on-disk value (write_cell aborts if
-        the row mapping is off). Writes only String columns (v1, byte-verified).
-        """
+        """Collect staged edits from both panes, confirm, then write with backup."""
         from snitchql.reader import write_cell
-        staged = []  # (pane, row_index, col, original)
-        total = 0
+        staged = []
         for pane in (self.pane_a, self.pane_b):
-            for (ri, cname), orig in pane._staged.items():
+            for (ri, cname), orig in pane.model.staged.items():
                 col = next(c for c in pane.table.columns if c.name == cname)
-                new_val = pane.table.rows[ri].get(cname)
                 staged.append((pane, ri, col, orig))
-                total += 1
         if not staged:
             return
-        # Build a readable summary
         lines = []
         for pane, ri, col, orig in staged:
             new_val = pane.table.rows[ri].get(col.name)
             lines.append(f"  • {Path(pane.path).name}  row {ri+1}, {col.name}:\n"
                          f"      {orig!r}  →  {new_val!r}")
-        msg = (f"About to write {total} change(s) to live .dat file(s).\n\n"
+        msg = (f"About to write {len(staged)} change(s) to live .dat file(s).\n\n"
                + "\n".join(lines)
                + "\n\nA backup (.bak) will be made first. This cannot be undone "
                  "from inside SnitchQL. Continue?")
         ans = QMessageBox.question(self, "Confirm write to disk", msg,
-                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if ans != QMessageBox.StandardButton.Yes:
             return
         written = 0
         errors = []
         for pane, ri, col, orig in staged:
             try:
-                # backup once per file
                 bak = Path(pane.path).with_suffix(".dat.bak")
                 if not bak.exists():
                     bak.write_bytes(Path(pane.path).read_bytes())
@@ -700,22 +673,20 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "Saved",
                                     f"Wrote {written} change(s). Backup saved as .bak.")
-        # refresh both panes from disk
+        # refresh both panes from disk (background read -> no hang)
         for pane in (self.pane_a, self.pane_b):
             if pane.path:
-                pane._silent_reopen()
+                pane._open_async(pane.path)
         self.edit_btn.setChecked(False)
         self.on_edit_mode(False)
 
     def on_dark(self, on):
-        """Toggle the dark-mode QSS. Off => light styling (soft green alternation)."""
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(DARK_QSS if on else LIGHT_QSS)
         self.dark_btn.setText("☀ Light" if on else "🌙 Dark")
 
     def on_layout(self, dual):
-        """Toggle between dual-pane (max 2) and single-pane views."""
         if dual:
             self.pane_b.setVisible(True)
             self.splitter.addWidget(self.pane_a)
@@ -724,63 +695,29 @@ class MainWindow(QMainWindow):
         else:
             self.pane_b.setVisible(False)
             self.layout_btn.setText("Layout: Single ▤")
-        # Compare only makes sense with both panes visible
         if not dual and self.compare_btn.isChecked():
             self.compare_btn.setChecked(False)
 
     def on_compare(self, checked):
-        # Compare needs both panes present; force dual layout on
         if checked and not self.pane_b.isVisible():
             self.layout_btn.setChecked(True)
             self.on_layout(True)
         if checked:
-            ka = self.pane_a.key_set()
-            kb = self.pane_b.key_set()
-            # rows whose key is in the OTHER table get "blocked out" (dimmed);
-            # rows unique to this table get a soft tint so they stand out
-            # without the eye-searing white-on-white of the old approach.
-            self._apply_compare(self.pane_a, kb, present_color=QColor(255, 224, 178),
-                                block_color=QColor(225, 225, 230))
-            self._apply_compare(self.pane_b, ka, present_color=QColor(178, 223, 255),
-                                block_color=QColor(225, 225, 230))
+            ka = self.pane_a.displayed_key_set()
+            kb = self.pane_b.displayed_key_set()
+            self.pane_a.model.set_compare(
+                self.pane_a.compare_state_map(kb),
+                block_color=QColor(225, 225, 230),
+                present_color=QColor(255, 224, 178))
+            self.pane_b.model.set_compare(
+                self.pane_b.compare_state_map(ka),
+                block_color=QColor(225, 225, 230),
+                present_color=QColor(178, 223, 255))
             self.compare_btn.setText("Compare ■ (on)")
         else:
-            self._clear_compare(self.pane_a)
-            self._clear_compare(self.pane_b)
+            self.pane_a.model.clear_compare()
+            self.pane_b.model.clear_compare()
             self.compare_btn.setText("Compare ▶")
-
-    def _apply_compare(self, pane, other_keys, present_color, block_color):
-        """Dim shared rows (block_color) and tint rows unique to this pane.
-
-        'Blocked out' = de-emphasised, NOT white: shared rows are faded so the
-        eye skips them, while unique rows keep a soft tint for contrast.
-        """
-        grid = pane.grid
-        for ri in range(grid.rowCount()):
-            key_item = grid.item(ri, 0)
-            if key_item is None:
-                continue
-            present = key_item.text() in other_keys
-            color = block_color if present else present_color
-            for ci in range(grid.columnCount()):
-                it = grid.item(ri, ci)
-                if it is not None:
-                    it.setBackground(color)
-
-    def _clear_compare(self, pane):
-        """Restore the grid's default row-shading instead of forcing solid white.
-
-        Using a null/default brush (not QColor(255,255,255)) lets Qt's
-        alternating-row styling come back — and avoids leaving a "white stain"
-        that survives subsequent repopulate() calls.
-        """
-        from PyQt6.QtGui import QBrush
-        grid = pane.grid
-        for ri in range(grid.rowCount()):
-            for ci in range(grid.columnCount()):
-                it = grid.item(ri, ci)
-                if it is not None:
-                    it.setBackground(QBrush())  # reset to default (alternating)
 
 
 def main():
