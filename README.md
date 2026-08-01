@@ -75,6 +75,10 @@ On first launch SnitchQL opens with **no preset data directory** — use
   `ORDER BY col [ASC|DESC]`, and `LIMIT n`. Results are read-only. There is no
   `eval`/code execution and no filesystem access — invalid queries raise a
   friendly error instead of crashing.
+- Column visibility: each pane has a **Columns** button to show/hide fields
+  (data is untouched, only the view is filtered).
+- Dark mode now fully themes the column header bar and other controls
+  (QHeaderView::section, checkboxes, status bar).
 - Index (`.idx`) verify: CONSISTENT on v4 integer indexes; other index
   versions report UNKNOWN honestly (no false corruption verdicts). Rebuild
   not yet implemented.

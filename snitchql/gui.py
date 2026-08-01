@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QFileDialog, QLineEdit, QLabel, QComboBox, QMessageBox,
     QHeaderView, QSplitter, QMenu, QInputDialog, QFrame, QDialog,
     QListWidget, QTextEdit, QTableView, QTableWidget, QTableWidgetItem,
+    QListWidgetItem,
 )
 from PyQt6.QtGui import QColor
 
@@ -119,12 +120,22 @@ QWidget { background-color: #2b2b2b; color: #e0e0e0; }
 QMainWindow, QDialog { background-color: #2b2b2b; }
 QPushButton { background-color: #3a3a3a; color: #e0e0e0; border: 1px solid #555; padding: 4px 8px; }
 QPushButton:checked { background-color: #4a6fa5; color: #ffffff; }
-QLineEdit, QComboBox, QTableView { background-color: #1f1f1f; color: #e0e0e0; gridline-color: #444; alternate-background-color: #333333; }
-QHeaderView::section { background-color: #3a3a3a; color: #e0e0e0; }
+QPushButton:hover { background-color: #454545; }
+QLineEdit, QComboBox, QTableView, QHeaderView { background-color: #1f1f1f; color: #e0e0e0; gridline-color: #444; alternate-background-color: #333333; }
+QHeaderView::section {
+    background-color: #3a3a3a;
+    color: #e0e0e0;
+    border: 1px solid #555;
+    padding: 4px;
+    qproperty-foreground: #e0e0e0;
+}
+QHeaderView::section:checked { background-color: #4a6fa5; }
 QMenu { background-color: #2b2b2b; color: #e0e0e0; }
 QLabel { color: #e0e0e0; }
 QSplitter::handle { background-color: #444; }
 QListWidget, QTextEdit { background-color: #1f1f1f; color: #e0e0e0; }
+QCheckBox, QRadioButton { color: #e0e0e0; }
+QStatusBar { background-color: #2b2b2b; color: #e0e0e0; }
 """
 
 
@@ -247,6 +258,7 @@ class Pane(QWidget):
         self.schema_btn = QPushButton("Schema")
         self.blob_btn = QPushButton("Blob")
         self.sql_btn = QPushButton("SQL")
+        self.cols_btn = QPushButton("Columns")
         self.schema_lbl = QLabel("")
         self.path_lbl = QLabel("")           # full path under the db name
         self.path_lbl.setStyleSheet("color: #888; font-size: 10px;")
@@ -257,6 +269,7 @@ class Pane(QWidget):
         bar.addWidget(self.schema_btn)
         bar.addWidget(self.blob_btn)
         bar.addWidget(self.sql_btn)
+        bar.addWidget(self.cols_btn)
         bar.addWidget(self.export_csv)
         bar.addWidget(self.export_json)
         self.layout.addLayout(bar)
@@ -304,6 +317,7 @@ class Pane(QWidget):
         self.schema_btn.clicked.connect(self.show_schema)
         self.blob_btn.clicked.connect(self.show_blobs)
         self.sql_btn.clicked.connect(self.show_sql)
+        self.cols_btn.clicked.connect(self.show_columns)
         self.filter_edit.textChanged.connect(self._on_quick_typed)
 
         self._all_rows = []   # full decoded rows (== self.table.rows)
@@ -516,6 +530,61 @@ class Pane(QWidget):
 
         run_btn.clicked.connect(on_run)
         close_btn.clicked.connect(dlg.reject)
+        dlg.exec()
+
+    # ---- column / field visibility ----
+    def show_columns(self):
+        """Open a checklist to show/hide columns in this pane's grid."""
+        if self.table is None:
+            QMessageBox.information(self, "Columns", "Open a .dat first.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Visible columns — {Path(self.path or 'table').name}")
+        dlg.resize(360, 480)
+        v = QVBoxLayout(dlg)
+        hint = QLabel("Tick the columns to show. Hidden columns are not deleted, "
+                      "just filtered from view.")
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        v.addWidget(hint)
+        list_w = QListWidget()
+        ncol = self.model.columnCount()
+        # map source column index -> visible state (inverse of grid hidden)
+        src_visible = []
+        for c in range(ncol):
+            item = QListWidgetItem(self.table.columns[c].name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            # a source column is visible if the grid shows the matching proxy col
+            visible = not self.grid.isColumnHidden(
+                self.proxy.mapFromSource(self.model.index(0, c)).column())
+            item.setCheckState(Qt.CheckState.Checked if visible
+                               else Qt.CheckState.Unchecked)
+            list_w.addItem(item)
+            src_visible.append(visible)
+        v.addWidget(list_w, 1)
+        btn_row = QHBoxLayout()
+        all_btn = QPushButton("All")
+        none_btn = QPushButton("None")
+        close_btn = QPushButton("Apply")
+        btn_row.addStretch(1)
+        btn_row.addWidget(all_btn)
+        btn_row.addWidget(none_btn)
+        btn_row.addWidget(close_btn)
+        v.addLayout(btn_row)
+
+        def apply():
+            for c in range(list_w.count()):
+                item = list_w.item(c)
+                show = item.checkState() == Qt.CheckState.Checked
+                # proxy column for this source column
+                pcol = self.proxy.mapFromSource(self.model.index(0, c)).column()
+                self.grid.setColumnHidden(pcol, not show)
+            dlg.accept()
+
+        all_btn.clicked.connect(lambda: [list_w.item(i).setCheckState(
+            Qt.CheckState.Checked) for i in range(list_w.count())])
+        none_btn.clicked.connect(lambda: [list_w.item(i).setCheckState(
+            Qt.CheckState.Unchecked) for i in range(list_w.count())])
+        close_btn.clicked.connect(apply)
         dlg.exec()
 
     # ---- loading via dialog ----

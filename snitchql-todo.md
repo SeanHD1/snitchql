@@ -27,14 +27,14 @@ Priority key: **P0** = critical (app hangs/unresponsive), **P1** = high (broken 
 
 - [x] **P0** — Add custom SQL query option (available only in Single View)
 - [x] **P1** — Add date picker control to allow editing dates (ties into "cannot edit dates" bug above)
-- [ ] **P1** — Add ability to select which fields/columns are visible in the view
+- [x] **P1** — Add ability to select which fields/columns are visible in the view
 - [x] **P2** — Insert full directory path under the db.dat name (currently only shows name)
 
 ---
 
 ## Cosmetics / UI
 
-- [ ] **P1** — Header bar is not respecting dark mode
+- [x] **P1** — Header bar is not respecting dark mode
 - [ ] **P2** — Set Dark Mode as the default theme
 - [ ] **P2** — Set Single View as the default view
 - [ ] **P2** — Rename prompt window header to something more descriptive (name TBD)

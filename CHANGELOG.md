@@ -45,6 +45,18 @@ holds; `.bak` backup created.
   Integer cell) is rejected with a warning instead of corrupting the row.
   (#P1 date picker / #P1 "cannot edit dates/ints/bools")
 
+### Added (round 4)
+
+- **Column / field visibility.** Each pane has a **Columns** button opening a
+  checklist of every field; untick to hide a column from the grid (data is
+  untouched, just filtered from view). "All" / "None" shortcuts included.
+  (#P1 column selection)
+- **Dark-mode header bar fix.** `DARK_QSS` now fully styles `QHeaderView::section`
+  (dark background, light foreground via `qproperty-foreground`, border, hover/
+  checked states) and adds `QCheckBox`/`QRadioButton`/`QStatusBar` rules, so the
+  column header bar and other controls respect dark mode instead of staying
+  light. (#P1 header bar not respecting dark mode)
+
 ### Added (round 3)
 
 - **Custom SQL query (Single View).** Each pane has a **SQL** button that opens
