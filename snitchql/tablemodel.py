@@ -57,6 +57,7 @@ class RowTableModel(QAbstractTableModel):
         self._edit_mode = False
         self._staged = {}        # (row_index, col_name) -> original value
         self._compare_state = []  # per-row: None / _CMP_BLOCK / _CMP_PRESENT
+        self._readonly = False    # True for SQL-query results (no disk backing)
         self._cmp_block = QColor(225, 225, 230)
         self._cmp_present = QColor(255, 224, 178)
 
@@ -69,8 +70,22 @@ class RowTableModel(QAbstractTableModel):
         self._hays = hays if hays is not None else []
         self._staged.clear()
         self._compare_state = [None] * len(self._rows)
+        self._readonly = False
         self.endResetModel()
         self.editStaged.emit(0)
+
+    def set_readonly(self, on: bool):
+        """Mark the current result as non-editable (e.g. a SQL query result
+        that has no backing .dat to write to). Clear any staging too."""
+        self._readonly = on
+        if on:
+            self._staged.clear()
+            self.editStaged.emit(0)
+        self.dataChanged.emit(
+            self.index(0, 0),
+            self.index(self.rowCount() - 1, self.columnCount() - 1),
+            [Qt.ItemDataRole.DisplayRole],
+        )
 
     def set_haystack(self, hays):
         self._hays = hays
@@ -124,14 +139,16 @@ class RowTableModel(QAbstractTableModel):
 
     def flags(self, index):
         f = super().flags(index)
-        if self._edit_mode and self.table and 0 <= index.column() < len(self.table.columns):
+        if self._edit_mode and not self._readonly and self.table \
+                and 0 <= index.column() < len(self.table.columns):
             col = self.table.columns[index.column()]
             if col.type_id in EDITABLE_TYPES:
                 f |= Qt.ItemFlag.ItemIsEditable
         return f
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
-        if role != Qt.ItemDataRole.EditRole or not self._edit_mode or not self.table:
+        if role != Qt.ItemDataRole.EditRole or not self._edit_mode \
+                or self._readonly or not self.table:
             return False
         col = self.table.columns[index.column()]
         if col.type_id not in EDITABLE_TYPES:

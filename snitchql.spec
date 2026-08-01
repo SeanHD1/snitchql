@@ -36,6 +36,7 @@ a = Analysis(
         "snitchql.blob",
         "snitchql.index",
         "snitchql.tablemodel",
+        "snitchql.sql",
         "PyQt6.QtWidgets",
         "PyQt6.QtGui",
         "PyQt6.QtCore",
@@ -67,7 +68,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,          # set False for a silent release build
+    console=False,         # windowed build: no terminal/console window on launch
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

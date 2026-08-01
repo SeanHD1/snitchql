@@ -63,11 +63,18 @@ On first launch SnitchQL opens with **no preset data directory** — use
 ## Status
 - Reader, GUI, filter builder, compare, schema, blobs, dark mode: working.
 - Time (type 10) and Date/Timestamp columns decoded to HH:MM:SS / dates.
-- Edit mode: tick "✎ Edit Mode" to edit String cells; edits stage and require a
+- Edit mode: tick "✎ Edit Mode" to edit cells. All scalar types are editable —
+  String, Date (with a calendar date picker), Time, Timestamp, Boolean,
+  ShortInt, Integer, Double, Currency, AutoInc. (BLOB stays read-only — it is a
+  pointer to a sibling `.blb`, not inline data.) Edits stage and require a
   confirm dialog before writing. Each write is guarded (aborts if the on-disk
-  value doesn't match) and a `.dat.bak` backup is made first. v1 edits String
-  columns only — numeric/BLOB/AutoInc are read-only until the row-offset model
-  for those types is cross-verified against pydbisam. Test on a COPY first.
+  value doesn't match) and a `.dat.bak` backup is made first. Test on a COPY first.
+- Custom SQL: each pane has a **SQL** button (Single View only) that runs a
+  small, safe query over the loaded table — `SELECT` (with `*` or a column
+  list), `WHERE` with `= != <> > < >= <= LIKE`, `AND`/`OR`, parentheses,
+  `ORDER BY col [ASC|DESC]`, and `LIMIT n`. Results are read-only. There is no
+  `eval`/code execution and no filesystem access — invalid queries raise a
+  friendly error instead of crashing.
 - Index (`.idx`) verify: CONSISTENT on v4 integer indexes; other index
   versions report UNKNOWN honestly (no false corruption verdicts). Rebuild
   not yet implemented.

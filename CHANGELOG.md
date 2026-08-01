@@ -45,6 +45,23 @@ holds; `.bak` backup created.
   Integer cell) is rejected with a warning instead of corrupting the row.
   (#P1 date picker / #P1 "cannot edit dates/ints/bools")
 
+### Added (round 3)
+
+- **Custom SQL query (Single View).** Each pane has a **SQL** button that opens
+  a query dialog and runs a small, safe SQL subset over the loaded table via a
+  hand-written recursive-descent parser (`snitchql.sql`): `SELECT * | col,…`,
+  `WHERE` with `= != <> > < >= <= LIKE`, `AND`/`OR`, parentheses,
+  `ORDER BY col [ASC|DESC]`, `LIMIT n`. There is **no eval and no filesystem
+  access** — a malformed or disallowed query (e.g. `DELETE`) raises `SqlError`
+  instead of crashing. Results display read-only in the pane; the feature is
+  gated to Single View (Dual View shows a prompt to switch). (#P0 custom SQL)
+- **Windowed Windows build.** `snitchql.spec` / `snitchql_onedir.spec` now set
+  `console=False`, so the frozen `.exe` no longer spawns a terminal window on
+  launch. In a frozen build, stdout/stderr are redirected to `SnitchQL.log`
+  next to the exe so diagnostics are captured without a visible console.
+  (Cannot run the PyInstaller build on this Linux box; spec change verified as
+  valid Python + `console=False` present.) (#P1 unexpected terminal window)
+
 ### Changed
 - Each pane shows the **full directory path** beneath the `.dat` name (previously
   only the file name). (#P2 full path)

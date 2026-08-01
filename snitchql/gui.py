@@ -38,6 +38,7 @@ from snitchql.tablemodel import (
     RowTableModel, RowProxyModel, ReaderThread, TypedCellDelegate,
     _CMP_BLOCK, _CMP_PRESENT,
 )
+from snitchql.sql import run_query, SqlError
 
 
 def _app_dir() -> Path:
@@ -245,6 +246,7 @@ class Pane(QWidget):
         self.export_json = QPushButton("JSON")
         self.schema_btn = QPushButton("Schema")
         self.blob_btn = QPushButton("Blob")
+        self.sql_btn = QPushButton("SQL")
         self.schema_lbl = QLabel("")
         self.path_lbl = QLabel("")           # full path under the db name
         self.path_lbl.setStyleSheet("color: #888; font-size: 10px;")
@@ -254,6 +256,7 @@ class Pane(QWidget):
         bar.addWidget(self.open_btn)
         bar.addWidget(self.schema_btn)
         bar.addWidget(self.blob_btn)
+        bar.addWidget(self.sql_btn)
         bar.addWidget(self.export_csv)
         bar.addWidget(self.export_json)
         self.layout.addLayout(bar)
@@ -300,6 +303,7 @@ class Pane(QWidget):
         self.export_json.clicked.connect(lambda: self.on_export("json"))
         self.schema_btn.clicked.connect(self.show_schema)
         self.blob_btn.clicked.connect(self.show_blobs)
+        self.sql_btn.clicked.connect(self.show_sql)
         self.filter_edit.textChanged.connect(self._on_quick_typed)
 
         self._all_rows = []   # full decoded rows (== self.table.rows)
@@ -442,6 +446,76 @@ class Pane(QWidget):
         close = QPushButton("Close")
         close.clicked.connect(dlg.accept)
         v.addWidget(close)
+        dlg.exec()
+
+    # ---- custom SQL query (Single View only) ----
+    def show_sql(self):
+        """Open a SQL query dialog. Runs against the loaded pane (read-only).
+
+        Per spec this is a Single View feature: if the app is in Dual layout the
+        user is told to switch to Single first, since results occupy the whole
+        pane.  The query runs over the already-decoded rows via the safe,
+        non-executing parser in ``snitchql.sql`` — no eval, no filesystem.
+        """
+        mw = self.window()
+        if mw is not None and hasattr(mw, "layout_btn") and mw.layout_btn.isChecked():
+            QMessageBox.information(
+                self, "Single View only",
+                "Custom SQL runs in Single View. Turn off 'Layout: Dual' first "
+                "(top toolbar) so the result can fill this pane.")
+            return
+        if self.table is None:
+            QMessageBox.information(self, "SQL", "Open a .dat first.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"SQL Query — {Path(self.path or 'table').name}")
+        dlg.resize(620, 360)
+        v = QVBoxLayout(dlg)
+        hint = QLabel("SELECT * FROM table  [WHERE …]  [ORDER BY col ASC|DESC]  [LIMIT n]\n"
+                      "Ops: = != <> > < >= <=  LIKE   Logic: AND OR ( )")
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        v.addWidget(hint)
+        editor = QTextEdit()
+        editor.setPlainText("SELECT * FROM table WHERE AutoChangePass = True LIMIT 50")
+        editor.setAcceptRichText(False)
+        v.addWidget(editor, 1)
+        err_lbl = QLabel("")
+        err_lbl.setStyleSheet("color: #c0392b;")
+        v.addWidget(err_lbl)
+        btn_row = QHBoxLayout()
+        run_btn = QPushButton("Run")
+        close_btn = QPushButton("Close")
+        btn_row.addStretch(1)
+        btn_row.addWidget(run_btn)
+        btn_row.addWidget(close_btn)
+        v.addLayout(btn_row)
+
+        def on_run():
+            sql = editor.toPlainText().strip()
+            if not sql:
+                return
+            try:
+                result = run_query(self.table.columns, self._all_rows, sql)
+            except SqlError as e:
+                err_lbl.setText(f"SQL error: {e}")
+                return
+            err_lbl.setText("")
+            # load the result as a read-only table in this pane
+            self.title.setText(f"SQL ▸ {Path(self.path or 'table').name}")
+            self.schema_lbl.setText(
+                f"{len(result.columns)} cols · {result.total_rows} rows")
+            self.path_lbl.setText(self.path or "")
+            self.model.set_table(result)
+            self.model.set_readonly(True)   # query results have no .dat to write
+            self.proxy.setSourceModel(self.model)
+            self.builder.set_fields([c.name for c in result.columns])
+            self.proxy.set_quick("")
+            self.rows_lbl.setText(f"{self.proxy.rowCount()} shown")
+            dlg.accept()
+
+        run_btn.clicked.connect(on_run)
+        close_btn.clicked.connect(dlg.reject)
         dlg.exec()
 
     # ---- loading via dialog ----
@@ -729,6 +803,24 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")  # clean cross-platform look
+    # In a frozen windowed build (console=False) any stray print()/traceback
+    # would otherwise be lost or, on some setups, trigger a console window.
+    # Redirect stdout/stderr to a log file next to the exe so diagnostics are
+    # captured without a visible terminal. Only active when frozen.
+    if getattr(sys, "frozen", False):
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(1024)
+            ctypes.windll.kernel32.GetModuleFileNameW(0, buf, 1024)
+            log_path = Path(buf.value).parent / "SnitchQL.log"
+        except Exception:
+            log_path = Path(sys.executable).parent / "SnitchQL.log"
+        try:
+            _log = open(log_path, "a", encoding="utf-8", buffering=1)
+            sys.stdout = _log
+            sys.stderr = _log
+        except Exception:
+            pass
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
