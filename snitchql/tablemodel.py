@@ -30,8 +30,11 @@ from PyQt6.QtCore import (
     Qt, pyqtSignal,
 )
 from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import QStyledItemDelegate, QMessageBox
 
-from snitchql.reader import EDITABLE_TYPES
+from snitchql.reader import (
+    EDITABLE_TYPES, editor_kind, display_for_edit, coerce_edit_value,
+)
 from snitchql import query as query_mod
 
 
@@ -238,6 +241,89 @@ class RowProxyModel(QSortFilterProxyModel):
             return lf < rf
         except (ValueError, TypeError):
             return (ls or "") < (rs or "")
+
+
+class TypedCellDelegate(QStyledItemDelegate):
+    """Per-column editor: date picker for Date, datetime for Timestamp,
+    time for Time, True/False combo for Boolean, plain text otherwise.
+
+    Coercion + validation are delegated to ``snitchql.reader.coerce_edit_value``
+    so a bad entry (e.g. "abc" in an Integer cell) is rejected with a friendly
+    message instead of corrupting the row.
+    """
+
+    def __init__(self, model, parent=None):
+        super().__init__(parent)
+        self._model = model
+
+    def createEditor(self, parent, option, index):
+        from PyQt6.QtWidgets import (
+            QDateEdit, QTimeEdit, QDateTimeEdit, QComboBox, QLineEdit,
+        )
+        from PyQt6.QtCore import QDate, QTime, QDateTime
+        col = self._model.table.columns[index.column()]
+        kind = editor_kind(col)
+        val = self._model.data(index, Qt.ItemDataRole.EditRole)
+        if kind == "date":
+            ed = QDateEdit(parent)
+            ed.setCalendarPopup(True)
+            ed.setDisplayFormat("yyyy-MM-dd")
+            if isinstance(val, str) and val[:10]:
+                try:
+                    y, m, d = (int(x) for x in val[:10].split("-"))
+                    ed.setDate(QDate(y, m, d))
+                except Exception:
+                    ed.setDate(QDate.currentDate())
+            return ed
+        if kind == "time":
+            ed = QTimeEdit(parent)
+            ed.setDisplayFormat("HH:mm:ss")
+            if isinstance(val, str):
+                try:
+                    ed.setTime(QTime.fromString(val, "HH:mm:ss"))
+                except Exception:
+                    pass
+            return ed
+        if kind == "ts":
+            ed = QDateTimeEdit(parent)
+            ed.setCalendarPopup(True)
+            ed.setDisplayFormat("yyyy-MM-ddTHH:mm:ss")
+            if isinstance(val, str):
+                try:
+                    ed.setDateTime(QDateTime.fromString(val, "yyyy-MM-ddTHH:mm:ss"))
+                except Exception:
+                    ed.setDateTime(QDateTime.currentDateTime())
+            return ed
+        if kind == "bool":
+            ed = QComboBox(parent)
+            ed.addItems(["False", "True"])
+            ed.setCurrentText("True" if val else "False")
+            return ed
+        ed = QLineEdit(parent)
+        ed.setText(display_for_edit(val, col))
+        return ed
+
+    def setModelData(self, editor, model, index):
+        from PyQt6.QtWidgets import QDateEdit, QTimeEdit, QDateTimeEdit, QComboBox, QLineEdit
+        col = self._model.table.columns[index.column()]
+        if isinstance(editor, QDateEdit):
+            text = editor.date().toString("yyyy-MM-dd")
+        elif isinstance(editor, QTimeEdit):
+            text = editor.time().toString("HH:mm:ss")
+        elif isinstance(editor, QDateTimeEdit):
+            text = editor.dateTime().toString("yyyy-MM-ddTHH:mm:ss")
+        elif isinstance(editor, QComboBox):
+            text = editor.currentText()
+        else:
+            text = editor.text()
+        try:
+            coerced = coerce_edit_value(text, col)
+        except ValueError as e:
+            QMessageBox.warning(editor, "Invalid value",
+                                f"{col.name}: {e}")
+            return
+        model.setData(index, "" if coerced is False and col.type_id == 4 else coerced,
+                      Qt.ItemDataRole.EditRole)
 
 
 class ReaderThread(QThread):

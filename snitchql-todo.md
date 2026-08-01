@@ -16,7 +16,7 @@ Priority key: **P0** = critical (app hangs/unresponsive), **P1** = high (broken 
 ## Bugs
 
 - [ ] **P1** — Unexpected terminal-like window opens during use (unclear trigger/purpose — needs investigation)
-- [ ] **P1** — Cannot edit dates at all same with integers or boolean values.
+- [x] **P1** — Cannot edit dates at all same with integers or boolean values.
 - [ ] **P2** — Blob error message header is not displaying properly
 - [x] **P2** — Save changes count does not clear/reset after file has been written
 - [ ] **P2** — Top row of buttons is not aligned with the bottom row of buttons
@@ -26,7 +26,7 @@ Priority key: **P0** = critical (app hangs/unresponsive), **P1** = high (broken 
 ## Feature Additions
 
 - [ ] **P0** — Add custom SQL query option (available only in Single View)
-- [ ] **P1** — Add date picker control to allow editing dates (ties into "cannot edit dates" bug above)
+- [x] **P1** — Add date picker control to allow editing dates (ties into "cannot edit dates" bug above)
 - [ ] **P1** — Add ability to select which fields/columns are visible in the view
 - [x] **P2** — Insert full directory path under the db.dat name (currently only shows name)
 

@@ -35,7 +35,8 @@ from PyQt6.QtGui import QColor
 from snitchql import query as query_mod
 from snitchql.reader import EDITABLE_TYPES
 from snitchql.tablemodel import (
-    RowTableModel, RowProxyModel, ReaderThread, _CMP_BLOCK, _CMP_PRESENT,
+    RowTableModel, RowProxyModel, ReaderThread, TypedCellDelegate,
+    _CMP_BLOCK, _CMP_PRESENT,
 )
 
 
@@ -288,6 +289,11 @@ class Pane(QWidget):
         self.proxy = RowProxyModel(self)
         self.proxy.setSourceModel(self.model)
         self.grid.setModel(self.proxy)
+        # Typed per-column editors (date picker, bool combo, etc.). The delegate
+        # reads the column type from the model at edit time, so it works for any
+        # table loaded after this point.
+        self._delegate = TypedCellDelegate(self.model)
+        self.grid.setItemDelegate(self._delegate)
 
         self.open_btn.clicked.connect(self.on_open)
         self.export_csv.clicked.connect(lambda: self.on_export("csv"))

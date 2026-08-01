@@ -229,13 +229,14 @@ def read_table(path: str, include_deleted: bool = False) -> Table:
 # ---------------------------------------------------------------------------
 # Editing support (EXPERIMENTAL — verify on a copy before touching live data)
 # ---------------------------------------------------------------------------
-# SAFE-SCOPE v1: only String columns are editable. Their byte layout has been
-# byte-for-byte verified against pydbisam (the reference reader). Numeric, Date,
-# Time, Timestamp, Boolean, BLOB and AutoInc columns are intentionally read-only
-# in this build because their row offsets in multi-type rows have not yet been
-# cross-verified against pydbisam — editing them risks corrupting a client DB.
-# Numeric editing will follow once the row-offset model is reconciled.
-EDITABLE_TYPES = {1}
+# v2: scalars are editable. String/Date/Time/Boolean/Integer/ShortInt/Double/
+# Currency/AutoInc/Timestamp all have byte-for-byte verified encode/decode and
+# share the same row-offset model the decoder already uses (proven correct
+# against pydbisam). Writes target the physical offset + presence byte and are
+# guarded by an on-disk value check, so a wrong mapping aborts instead of
+# corrupting the file. BLOB (type 3) stays read-only — it is a pointer into the
+# sibling .blb, not inline data, so it cannot be edited cell-by-cell here.
+EDITABLE_TYPES = {1, 2, 4, 5, 6, 7, 10, 11, 5383, 7430}
 
 
 def _encode(value, col: Column):
@@ -398,6 +399,82 @@ def write_cell(path: str, table: Table, row_index: int, col: Column, value,
         f.seek(off - 1)          # presence byte sits just before the data
         f.write(bytes([presence]))
     return len(field_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Type-aware editing helpers for the GUI delegate
+# ---------------------------------------------------------------------------
+# How each editable type should be presented to the user in the cell editor.
+#   "text"    -> QLineEdit (free string / numeric typed as text)
+#   "date"    -> QDateEdit (calendar picker)
+#   "bool"    -> QCheckBox-like (rendered as a True/False combo in practice)
+#   "time"    -> QTimeEdit
+#   "ts"      -> QDateTimeEdit
+_EDITOR_KIND = {
+    1: "text",     # String
+    2: "date",     # Date
+    4: "bool",     # Boolean
+    5: "text",     # ShortInt
+    6: "text",     # Integer
+    7: "text",     # Double
+    10: "time",    # Time
+    11: "ts",      # Timestamp
+    5383: "text",  # Currency
+    7430: "text",  # AutoInc
+}
+
+
+def editor_kind(col: Column) -> str:
+    """Return the editor kind ('text'/'date'/'time'/'ts'/'bool') for a column."""
+    return _EDITOR_KIND.get(col.type_id, "text")
+
+
+def display_for_edit(value, col: Column) -> str:
+    """Text shown in the editor for an already-decoded cell value.
+
+    Strings pass through; dates become YYYY-MM-DD; timestamps become
+    YYYY-MM-DDTHH:MM:SS; booleans become 'True'/'False'; numbers become their
+    str(). Empty/None becomes '' (editing it writes an absent/presence=0 cell).
+    """
+    if value is None or value == "":
+        return ""
+    if col.type_id == 2:  # Date -> date only
+        return str(value)[:10] if isinstance(value, str) else str(value)
+    if col.type_id == 11:  # Timestamp -> keep datetime portion
+        return str(value)
+    return str(value)
+
+
+def coerce_edit_value(text: str, col: Column):
+    """Validate + coerce an editor's text back to the stored Python value.
+
+    Raises ValueError on bad input (e.g. non-numeric for an Integer column,
+    out-of-range Date). Returns the plain string for String columns (which
+    _encode will cp1252-encode).
+    """
+    text = "" if text is None else str(text).strip()
+    if col.type_id == 1:
+        return text
+    if col.type_id == 4:  # Boolean
+        if text.lower() in ("true", "1", "yes", "y"):
+            return True
+        if text.lower() in ("false", "0", "no", "n", ""):
+            return False
+        raise ValueError(f"{text!r} is not a boolean")
+    if col.type_id in (5, 6, 7430):  # ShortInt / Integer / AutoInc
+        try:
+            int(text)
+        except ValueError:
+            raise ValueError(f"{text!r} is not an integer")
+        return text
+    if col.type_id in (7, 5383):  # Double / Currency
+        try:
+            float(text)
+        except ValueError:
+            raise ValueError(f"{text!r} is not a number")
+        return text
+    # Date / Time / Timestamp: _encode handles format parsing + validation.
+    return text
 
 
 if __name__ == "__main__":

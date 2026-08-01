@@ -34,9 +34,18 @@ Verified headless against the real GUI (12/12 checks): virtual paint 11 ms vs
 persists to disk + non-blocking reload (~0.6 s); stale-load supersede guard
 holds; `.bak` backup created.
 
-### Changed
+### Added (round 2)
 
-- "Quick" filter is now labelled **"Quick Filter:"** for clarity. (#P2 rename)
+- **Scalar column editing + date picker.** All scalar types are now editable,
+  not just String: Date, Time, Timestamp, Boolean, ShortInt, Integer, Double,
+  Currency, AutoInc. A typed cell editor (`TypedCellDelegate`) picks the right
+  widget per column: a calendar **date picker** (QDateEdit) for Date, a datetime
+  picker for Timestamp, a time editor for Time, a True/False combo for Boolean,
+  and a validated text editor for numbers. Invalid input (e.g. "abc" in an
+  Integer cell) is rejected with a warning instead of corrupting the row.
+  (#P1 date picker / #P1 "cannot edit dates/ints/bools")
+
+### Changed
 - Each pane shows the **full directory path** beneath the `.dat` name (previously
   only the file name). (#P2 full path)
 - Save Changes button count correctly resets to `(0)` and disables after a
