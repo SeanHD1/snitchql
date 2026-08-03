@@ -7,6 +7,22 @@ test on a copy first").
 
 ## [Unreleased]
 
+### P2/P3 polish — final backlog items closed
+
+- **Dark Mode default.** App now launches in dark theme (persisted in
+  `snitchql.ini` as `dark=1`; toggling restores light and is remembered).
+- **Single View default.** App launches in Single (one-pane) view by default
+  (persisted as `layout_dual=0`); Dual is still one click away.
+- **Column/button alignment.** Top toolbar buttons left-align consistently with
+  the pane toolbars (removed the stray stretch that pushed them right).
+- **Blob dialog header.** The blob viewer now shows a clear header line
+  (filename · version · block size · record count · bytes scanned) instead of a
+  cramped inline label, so error/empty states read correctly.
+- **Open dialog title.** "Open DBISAM table (.dat)" — descriptive prompt header.
+- **Default directory.** Removed the old "All Dats" sub-folder magic; default
+  data dir is now the user's Desktop (falling back to the exe's directory),
+  persisted via "Set Data Dir…".
+
 ### Performance — P0 hangs fixed (the big one)
 
 The GUI froze ("not responding") on three operations because every heavy step

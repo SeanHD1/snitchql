@@ -23,7 +23,7 @@ Performance note (P0 fix):
 import os
 import sys
 from pathlib import Path
-from PyQt6.QtCore import QDir, Qt, QSize, QModelIndex
+from PyQt6.QtCore import QDir, Qt, QSize, QModelIndex, QStandardPaths
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QLineEdit, QLabel, QComboBox, QMessageBox,
@@ -64,7 +64,7 @@ def _app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-# --- persisted config (remembers the user's chosen data dir) ---
+# --- persisted config (remembers the user's chosen data dir + UI prefs) ---
 def _config_path() -> Path:
     """snitchql.ini next to the real exe (works frozen + from source)."""
     if getattr(sys, "frozen", False):
@@ -94,17 +94,45 @@ def _save_data_dir(d: str):
         pass
 
 
+def _load_bool(name: str, default: bool) -> bool:
+    """Read a `name=1|0` line from the ini (used for dark / layout prefs)."""
+    p = _config_path()
+    if p.is_file():
+        for line in p.read_text().splitlines():
+            if line.strip().lower().startswith(f"{name}="):
+                return line.split("=", 1)[1].strip() not in ("", "0", "false", "no")
+    return default
+
+
+def _save_bool(name: str, value: bool):
+    p = _config_path()
+    try:
+        lines = p.read_text().splitlines() if p.is_file() else []
+        kept = [l for l in lines if not l.strip().lower().startswith(f"{name}=")]
+        kept.append(f"{name}={1 if value else 0}")
+        p.write_text("\n".join(kept) + "\n")
+    except Exception:
+        pass
+
+
 # Auto-load folder resolution. A previously chosen data dir (via "Set Data
-# Dir...") is remembered in snitchql.ini and takes priority. Otherwise, if an
-# "All Dats" folder sits next to the exe we use that; else the exe's own dir.
+# Dir...") is remembered in snitchql.ini and takes priority. Otherwise we
+# default to the user's Desktop (closest to the old "All Dats" convention),
+# falling back to the executable's own directory if the Desktop can't be found.
+# (The old "All Dats" sub-folder magic has been removed — see P3 cleanup.)
 _APP_DIR = _app_dir()
 _remembered = _load_data_dir()
 if _remembered:
     DEFAULT_DIR = _remembered
-elif (_APP_DIR / "All Dats").is_dir():
-    DEFAULT_DIR = str(_APP_DIR / "All Dats")
 else:
-    DEFAULT_DIR = str(_APP_DIR)
+    _desktop = ""
+    try:
+        _dp = QStandardPaths.standardLocations(QStandardPaths.StandardLocation.DesktopLocation)
+        if _dp:
+            _desktop = _dp[0]
+    except Exception:
+        _desktop = ""
+    DEFAULT_DIR = _desktop if (_desktop and Path(_desktop).is_dir()) else str(_APP_DIR)
 
 # Light-mode QSS. Soft light-green alternating rows (no eye-searing blue), and a
 # gentle tint for the grid. Dark mode (DARK_QSS) overrides this when toggled on.
@@ -429,9 +457,12 @@ class Pane(QWidget):
         dlg.setWindowTitle(f"Blobs — {blb.name}")
         dlg.resize(720, 520)
         v = QVBoxLayout(dlg)
-        v.addWidget(QLabel(
-            f"version {info['version']} · block size {info['block_size']} · "
-            f"{len(info['records'])} records (scanned {info['scanned']:,} bytes)"))
+        header = QLabel(
+            f"Blob file: {blb.name}   ·   version {info['version']}   ·   "
+            f"block size {info['block_size']}   ·   {len(info['records'])} records "
+            f"(scanned {info['scanned']:,} bytes)")
+        header.setStyleSheet("color: #888; font-size: 11px;")
+        v.addWidget(header)
         list_w = QListWidget()
         for i, rec in enumerate(info["records"]):
             if rec["text"] is not None:
@@ -590,7 +621,7 @@ class Pane(QWidget):
     # ---- loading via dialog ----
     def on_open(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open DBISAM .dat", DEFAULT_DIR, "DBISAM (*.dat)")
+            self, "Open DBISAM table (.dat)", DEFAULT_DIR, "DBISAM tables (*.dat)")
         if not path:
             return
         self._open_async(path)
@@ -697,22 +728,28 @@ class MainWindow(QMainWindow):
         self.save_btn.clicked.connect(self.on_save_changes)
         self.layout_btn = QPushButton("Layout: Dual ▦")
         self.layout_btn.setCheckable(True)
-        self.layout_btn.setChecked(True)
+        # Default view is Single (per backlog). Persisted via snitchql.ini.
+        self._default_dual = _load_bool("layout_dual", False)
+        self.layout_btn.setChecked(self._default_dual)
         self.layout_btn.toggled.connect(self.on_layout)
         self.dark_btn = QPushButton("🌙 Dark")
         self.dark_btn.setCheckable(True)
+        # Default theme is Dark (per backlog). Persisted via snitchql.ini.
+        self._default_dark = _load_bool("dark", True)
+        self.dark_btn.setChecked(self._default_dark)
         self.dark_btn.toggled.connect(self.on_dark)
         self.compare_btn = QPushButton("Compare ▶")
         self.compare_btn.setCheckable(True)
         self.compare_btn.toggled.connect(self.on_compare)
         top.addWidget(QLabel("SnitchQL"))
-        top.addStretch(1)
+        top.addSpacing(12)
         top.addWidget(self.dir_btn)
         top.addWidget(self.edit_btn)
         top.addWidget(self.save_btn)
         top.addWidget(self.layout_btn)
         top.addWidget(self.dark_btn)
         top.addWidget(self.compare_btn)
+        top.addStretch(1)
         root.addLayout(top)
 
         # splitter with two panes
@@ -765,6 +802,10 @@ class MainWindow(QMainWindow):
             self.pane_a._open_async(picked[0])
         if len(picked) >= 2:
             self.pane_b._open_async(picked[1])
+
+        # Apply persisted UI defaults (Single view + Dark theme on first run).
+        self.on_dark(self._default_dark)
+        self.on_layout(self._default_dual)
 
     def on_set_dir(self):
         d = QFileDialog.getExistingDirectory(
@@ -834,6 +875,7 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.setStyleSheet(DARK_QSS if on else LIGHT_QSS)
         self.dark_btn.setText("☀ Light" if on else "🌙 Dark")
+        _save_bool("dark", on)
 
     def on_layout(self, dual):
         if dual:
@@ -844,6 +886,7 @@ class MainWindow(QMainWindow):
         else:
             self.pane_b.setVisible(False)
             self.layout_btn.setText("Layout: Single ▤")
+        _save_bool("layout_dual", dual)
         if not dual and self.compare_btn.isChecked():
             self.compare_btn.setChecked(False)
 
