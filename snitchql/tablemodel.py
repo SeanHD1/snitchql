@@ -60,6 +60,30 @@ class RowTableModel(QAbstractTableModel):
         self._readonly = False    # True for SQL-query results (no disk backing)
         self._cmp_block = QColor(225, 225, 230)
         self._cmp_present = QColor(255, 224, 178)
+        # Current grid background colours (theme-aware). Used by compare so a
+        # "block" row's *font* can be set to the exact background colour, making
+        # the text vanish into the row and letting the unique ("present") rows
+        # stand out. Defaults match LIGHT_QSS; the UI pushes DARK_QSS values via
+        # set_grid_backgrounds() whenever the theme toggles.
+        self._grid_base = QColor(255, 255, 255)   # even rows
+        self._grid_alt = QColor(0xe8, 0xf3, 0xec)  # odd rows (alternate)
+
+    def set_grid_backgrounds(self, base, alt):
+        """Tell the model the current theme's grid background colours.
+
+        ``base`` = even-row background, ``alt`` = odd-row (alternating) background.
+        Either may be a (r, g, b) tuple or an existing QColor. Compare uses these
+        to paint "block" text with a colour identical to the row background, so
+        those rows visually disappear.
+        """
+        self._grid_base = QColor(*base) if isinstance(base, (tuple, list)) else QColor(base)
+        self._grid_alt = QColor(*alt) if isinstance(alt, (tuple, list)) else QColor(alt)
+        if self._rows:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(self.rowCount() - 1, self.columnCount() - 1),
+                [Qt.ItemDataRole.ForegroundRole],
+            )
 
     # -- data loading --------------------------------------------------------
     def set_table(self, table, hays=None):
@@ -112,15 +136,19 @@ class RowTableModel(QAbstractTableModel):
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             return "" if val is None else str(val)
         if role == Qt.ItemDataRole.ForegroundRole:
-            # Compare highlighting: per Damion's note, we do NOT paint the row
-            # background — instead we tint the *font* with the compare colour so
-            # the emphasis is on the text, not a filled background. _cmp_block /
-            # _cmp_present hold those colours (set via set_compare from the UI).
+            # Compare highlighting (per Damion's note): we do NOT paint the row
+            # background. Instead:
+            #   * "block" rows (present in the OTHER pane too) get a font colour
+            #     identical to the row's own background, so the text disappears
+            #     and the eye is drawn to the differences.
+            #   * "present" rows (unique to this pane) keep normal visible text
+            #     so they stand out against the vanished block rows.
             st = self._compare_state[index.row()]
             if st == _CMP_BLOCK:
-                return self._cmp_block
+                bg = self._grid_alt if (index.row() % 2 == 1) else self._grid_base
+                return bg
             if st == _CMP_PRESENT:
-                return self._cmp_present
+                return None  # normal foreground — these are the lines to see
             if self._edit_mode and col.type_id not in EDITABLE_TYPES:
                 return QColor(150, 150, 150)
             return None

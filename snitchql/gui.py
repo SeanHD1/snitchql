@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QFileDialog, QLineEdit, QLabel, QComboBox, QMessageBox,
     QHeaderView, QSplitter, QMenu, QInputDialog, QFrame, QDialog,
     QListWidget, QTextEdit, QTableView, QTableWidget, QTableWidgetItem,
-    QListWidgetItem, QCheckBox,
+    QListWidgetItem, QCheckBox, QCompleter,
 )
 from PyQt6.QtGui import QColor, QIcon
 
@@ -193,6 +193,66 @@ def _import_file(path: str):
                 for o in objs]
         return cols, rows
     raise ValueError(f"unsupported import type: {suffix}")
+
+
+class CompleterTextEdit(QTextEdit):
+    """QTextEdit with word-level autocompletion, for the SQL query box.
+
+    QTextEdit has no native QCompleter support, so we drive it through an event
+    filter: pressing Tab (or Ctrl+Space) pops a list of matching words culled
+    from the SQL keyword set plus the current table's columns. Enter/Tab while
+    the popup is open accepts the highlighted completion.
+    """
+
+    def __init__(self, words, parent=None):
+        super().__init__(parent)
+        self.setAcceptRichText(False)
+        self._comp = QCompleter(sorted(set(words)), self)
+        self._comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._comp.setWidget(self)
+        self._comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self._comp.activated.connect(self._insert_completion)
+
+    def _current_word(self):
+        """Return (word_before_cursor, start_offset) for the token under the caret."""
+        cur = self.textCursor()
+        pos = cur.position()
+        text = self.toPlainText()
+        start = pos
+        while start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_"):
+            start -= 1
+        return text[start:pos], start
+
+    def _insert_completion(self, completion):
+        cur = self.textCursor()
+        word, start = self._current_word()
+        cur.setPosition(start)
+        cur.setPosition(start + len(word), Qt.TextCursor.MoveMode.KeepAnchor)
+        cur.insertText(completion)
+        self.setTextCursor(cur)
+
+    def _show_completions(self):
+        word, _ = self._current_word()
+        if len(word) < 1:
+            self._comp.popup().hide()
+            return
+        self._comp.setCompletionPrefix(word)
+        if self._comp.completionCount() == 0:
+            self._comp.popup().hide()
+            return
+        self._comp.complete(self.cursorRect())
+
+    def keyPressEvent(self, e):
+        if self._comp.popup().isVisible():
+            if e.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Enter, Qt.Key.Key_Return):
+                e.ignore()  # let the completer insert the highlighted completion
+                return
+        super().keyPressEvent(e)
+        ctrl = e.modifiers() & Qt.KeyboardModifier.ControlModifier
+        if ctrl and e.key() == Qt.Key.Key_Space:
+            self._show_completions()
+        elif e.key() == Qt.Key.Key_Tab and not self._comp.popup().isVisible():
+            self._show_completions()
 
 
 # Light-mode QSS. Soft light-green alternating rows (no eye-searing blue), and a
@@ -603,7 +663,14 @@ class Pane(QWidget):
                       "Ops: = != <> > < >= <=  LIKE   Logic: AND OR ( )")
         hint.setStyleSheet("color: #888; font-size: 11px;")
         v.addWidget(hint)
-        editor = QTextEdit()
+        # Autocomplete vocabulary: SQL keywords + this table's column names.
+        SQL_KEYWORDS = [
+            "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "LIKE", "IN",
+            "ORDER", "BY", "ASC", "DESC", "LIMIT", "OFFSET", "AS", "DISTINCT",
+            "NULL", "IS", "BETWEEN", "GROUP", "HAVING",
+        ]
+        col_names = [c.name for c in self.table.columns] if self.table else []
+        editor = CompleterTextEdit(SQL_KEYWORDS + col_names + ["table"], parent=dlg)
         editor.setPlainText("")
         editor.setAcceptRichText(False)
         v.addWidget(editor, 1)
@@ -1096,6 +1163,23 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(DARK_QSS if on else LIGHT_QSS)
         self.dark_btn.setText("☀ Light" if on else "🌙 Dark")
         _save_bool("dark", on)
+        # Keep the compare font-colour (which must equal the row background to
+        # make "block" rows vanish) in sync with the active theme's grid colours.
+        self._push_grid_backgrounds(on)
+
+    def _push_grid_backgrounds(self, dark):
+        """Push the current theme's grid backgrounds into every pane's model.
+
+        Compare paints "block" text with the exact row background so those rows
+        disappear; if the theme changes we must update those colours too.
+        """
+        if dark:
+            base, alt = (31, 31, 31), (51, 51, 51)        # #1f1f1f / #333333
+        else:
+            base, alt = (255, 255, 255), (0xe8, 0xf3, 0xec)  # white / #e8f3ec
+        for pane in (self.pane_a, self.pane_b):
+            if pane.model is not None:
+                pane.model.set_grid_backgrounds(base, alt)
 
     def on_layout(self, dual):
         if dual:
