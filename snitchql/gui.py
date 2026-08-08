@@ -1204,18 +1204,22 @@ class MainWindow(QMainWindow):
         self._push_grid_backgrounds(on)
 
     def _push_grid_backgrounds(self, dark):
-        """Push the current theme's grid backgrounds into every pane's model.
+        """Push the current theme's *actual* grid backgrounds into every pane's model.
 
-        Compare paints "block" text with the exact row background so those rows
-        disappear; if the theme changes we must update those colours too.
+        Compare paints "block" text with a colour identical to the row background
+        so those rows vanish. We read the real colours from the grid's resolved
+        palette (Base + AlternateBase) rather than hardcoding QSS hexes — the QSS
+        can be overridden/resolved differently, and an inexact match would leave a
+        faint dim colour instead of true invisibility.
         """
-        if dark:
-            base, alt = (31, 31, 31), (51, 51, 51)        # #1f1f1f / #333333
-        else:
-            base, alt = (255, 255, 255), (0xe8, 0xf3, 0xec)  # white / #e8f3ec
+        from PyQt6.QtGui import QPalette
         for pane in (self.pane_a, self.pane_b):
-            if pane.model is not None:
-                pane.model.set_grid_backgrounds(base, alt)
+            if pane.model is None or pane.grid is None:
+                continue
+            pal = pane.grid.palette()
+            base = pal.color(QPalette.ColorRole.Base)
+            alt = pal.color(QPalette.ColorRole.AlternateBase)
+            pane.model.set_grid_backgrounds(base, alt)
 
     def on_layout(self, dual):
         if dual:

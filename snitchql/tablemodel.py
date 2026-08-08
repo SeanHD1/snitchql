@@ -63,10 +63,12 @@ class RowTableModel(QAbstractTableModel):
         # Current grid background colours (theme-aware). Used by compare so a
         # "block" row's *font* can be set to the exact background colour, making
         # the text vanish into the row and letting the unique ("present") rows
-        # stand out. Defaults match LIGHT_QSS; the UI pushes DARK_QSS values via
-        # set_grid_backgrounds() whenever the theme toggles.
-        self._grid_base = QColor(255, 255, 255)   # even rows
-        self._grid_alt = QColor(0xe8, 0xf3, 0xec)  # odd rows (alternate)
+        # stand out. The app defaults to DARK mode, so initialise to the dark grid
+        # colours (#1f1f1f base / #333333 alternate) — on_dark() pushes the real
+        # resolved palette colours once the grid exists, which is always equal or
+        # very close. Defaults match the DARK_QSS grid, not light.
+        self._grid_base = QColor(31, 31, 31)     # even rows (dark grid base)
+        self._grid_alt = QColor(51, 51, 51)      # odd rows (dark alternate)
 
     def set_grid_backgrounds(self, base, alt):
         """Tell the model the current theme's grid background colours.
