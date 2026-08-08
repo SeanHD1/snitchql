@@ -57,8 +57,8 @@ Python, but it's brittle for PyQt6. Building on Windows is strongly recommended.
 ## Data location
 On first launch SnitchQL opens with **no preset data directory** — use
 **Set Data Dir…** to pick your DBISAM folder. The choice is remembered in
-`snitchql.ini` next to the exe, so it persists across restarts. If an
-`All Dats` folder sits next to the exe, it auto-loads that as a convenience.
+`snitchql.ini` next to the exe, so it persists across restarts. If a data
+directory was previously chosen, it is restored automatically on next launch.
 
 ## Status
 - Reader, GUI, filter builder, compare, schema, blobs, dark mode: working.

@@ -112,15 +112,21 @@ class RowTableModel(QAbstractTableModel):
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             return "" if val is None else str(val)
         if role == Qt.ItemDataRole.ForegroundRole:
-            if self._edit_mode and col.type_id not in EDITABLE_TYPES:
-                return QColor(150, 150, 150)
-            return None
-        if role == Qt.ItemDataRole.BackgroundRole:
+            # Compare highlighting: per Damion's note, we do NOT paint the row
+            # background — instead we tint the *font* with the compare colour so
+            # the emphasis is on the text, not a filled background. _cmp_block /
+            # _cmp_present hold those colours (set via set_compare from the UI).
             st = self._compare_state[index.row()]
             if st == _CMP_BLOCK:
                 return self._cmp_block
             if st == _CMP_PRESENT:
                 return self._cmp_present
+            if self._edit_mode and col.type_id not in EDITABLE_TYPES:
+                return QColor(150, 150, 150)
+            return None
+        if role == Qt.ItemDataRole.BackgroundRole:
+            # Intentionally left unpainted for compare rows — the background is
+            # never altered by compare (see ForegroundRole above).
             return None
         return None
 
@@ -203,6 +209,13 @@ class RowProxyModel(QSortFilterProxyModel):
     Sits between ``RowTableModel`` and the ``QTableView``. Sorting is handled
     natively; filtering recomputes only when ``invalidateFilter`` is called
     (i.e. when the user types or hits Apply).
+
+    The Quick filter can run in two modes:
+      * full scan  — substring across every column's values (slower on huge
+        tables, but always complete);
+      * indexed    — substring across only the columns that have a DBISAM index
+        (fast; the engine would use the index for the same lookup). The set of
+        indexed columns is supplied by the UI from the sibling .idx files.
     """
 
     def __init__(self, parent=None):
@@ -210,15 +223,34 @@ class RowProxyModel(QSortFilterProxyModel):
         self._quick = ""
         self._rules = []
         self._combine = "AND"
+        self._indexed_cols = []          # column names that are indexed
+        self._indexed_hays = None        # per-row indexed-only haystack (lazy)
 
-    def set_quick(self, text):
+    def set_quick(self, text, indexed_only: bool = False):
         self._quick = (text or "").strip().lower()
+        self._indexed_only = indexed_only
         self.invalidateFilter()
 
     def set_rules(self, rules, combine="AND"):
         self._rules = rules or []
         self._combine = combine
         self.invalidateFilter()
+
+    def set_indexed_columns(self, names):
+        """Tell the proxy which columns are indexed (for the fast quick-filter)."""
+        self._indexed_cols = list(names)
+        self._indexed_hays = None  # rebuilt lazily on next filter pass
+
+    def _build_indexed_haystack(self, model):
+        rows = model._rows
+        cols = self._indexed_cols
+        self._indexed_hays = [
+            " ".join(
+                "" if r.get(c) is None else str(r.get(c))
+                for c in cols
+            ).lower()
+            for r in rows
+        ]
 
     def clear_filters(self):
         self._quick = ""
@@ -237,9 +269,17 @@ class RowProxyModel(QSortFilterProxyModel):
             ok = all(results) if self._combine == "AND" else any(results)
             if not ok:
                 return False
-        # quick substring — uses the precomputed haystack when available
+        # quick substring
         if self._quick:
-            if model._hays and source_row < len(model._hays):
+            if getattr(self, "_indexed_only", False) and self._indexed_cols:
+                if self._indexed_hays is None:
+                    self._build_indexed_haystack(model)
+                hay = (self._indexed_hays[source_row]
+                       if self._indexed_hays and source_row < len(self._indexed_hays)
+                       else "")
+                if self._quick not in hay:
+                    return False
+            elif model._hays and source_row < len(model._hays):
                 if self._quick not in model._hays[source_row]:
                     return False
             else:

@@ -29,9 +29,9 @@ from PyQt6.QtWidgets import (
     QPushButton, QFileDialog, QLineEdit, QLabel, QComboBox, QMessageBox,
     QHeaderView, QSplitter, QMenu, QInputDialog, QFrame, QDialog,
     QListWidget, QTextEdit, QTableView, QTableWidget, QTableWidgetItem,
-    QListWidgetItem,
+    QListWidgetItem, QCheckBox,
 )
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QIcon
 
 from snitchql import query as query_mod
 from snitchql.reader import EDITABLE_TYPES
@@ -133,6 +133,67 @@ else:
     except Exception:
         _desktop = ""
     DEFAULT_DIR = _desktop if (_desktop and Path(_desktop).is_dir()) else str(_APP_DIR)
+
+# ---------------------------------------------------------------------------
+# Import helper: CSV / JSON / JSONL -> (column_names, list_of_row_dicts)
+# ---------------------------------------------------------------------------
+def _import_file(path: str):
+    """Parse a CSV or JSON file into (columns, rows).
+
+    CSV: first row = headers; every row becomes a dict keyed by header.
+    JSON: either a list of objects (keys = columns) or a list of lists with an
+    optional header row. JSONL (.jsonl / .ndjson): one JSON object per line.
+    Returns (list[str], list[dict]). Raises ValueError on anything unrecognisable.
+    """
+    from pathlib import Path as _P
+    suffix = _P(path).suffix.lower()
+    if suffix == ".csv":
+        import csv
+        with open(path, "r", newline="", encoding="utf-8-sig", errors="replace") as f:
+            reader = csv.reader(f)
+            rows_raw = list(reader)
+        if not rows_raw:
+            return [], []
+        header = [h.strip() or f"col{i+1}" for i, h in enumerate(rows_raw[0])]
+        rows = []
+        for r in rows_raw[1:]:
+            d = {header[i]: (r[i] if i < len(r) else "") for i in range(len(header))}
+            rows.append(d)
+        return header, rows
+    if suffix in (".json", ".jsonl", ".ndjson"):
+        import json
+        text = open(path, "r", encoding="utf-8-sig", errors="replace").read().strip()
+        if not text:
+            return [], []
+        if suffix == ".jsonl":
+            objs = [json.loads(line) for line in text.splitlines() if line.strip()]
+        else:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                # common export wrapper: {"columns": [...], "rows": [...]}
+                if "rows" in data:
+                    objs = data["rows"]
+                    if "columns" in data and isinstance(data["columns"], list):
+                        return [str(c) for c in data["columns"]], [dict(r) for r in objs]
+                else:
+                    objs = [data]
+            elif isinstance(data, list):
+                objs = data
+            else:
+                raise ValueError("unsupported JSON shape")
+        if not objs:
+            return [], []
+        cols = []
+        for o in objs:
+            if isinstance(o, dict):
+                for k in o.keys():
+                    if k not in cols:
+                        cols.append(k)
+        rows = [dict(o) if isinstance(o, dict) else {f"col{i+1}": v for i, v in enumerate(o) if isinstance(o, (list, tuple))}
+                for o in objs]
+        return cols, rows
+    raise ValueError(f"unsupported import type: {suffix}")
+
 
 # Light-mode QSS. Soft light-green alternating rows (no eye-searing blue), and a
 # gentle tint for the grid. Dark mode (DARK_QSS) overrides this when toggled on.
@@ -287,6 +348,7 @@ class Pane(QWidget):
         self.blob_btn = QPushButton("Blob")
         self.sql_btn = QPushButton("SQL")
         self.cols_btn = QPushButton("Columns")
+        self.import_btn = QPushButton("Import")
         self.schema_lbl = QLabel("")
         self.path_lbl = QLabel("")           # full path under the db name
         self.path_lbl.setStyleSheet("color: #888; font-size: 10px;")
@@ -298,6 +360,7 @@ class Pane(QWidget):
         bar.addWidget(self.blob_btn)
         bar.addWidget(self.sql_btn)
         bar.addWidget(self.cols_btn)
+        bar.addWidget(self.import_btn)
         bar.addWidget(self.export_csv)
         bar.addWidget(self.export_json)
         self.layout.addLayout(bar)
@@ -307,8 +370,14 @@ class Pane(QWidget):
         fbar = QHBoxLayout()
         fbar.addWidget(QLabel("Quick Filter:"))
         self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("substring across all columns")
+        self.filter_edit.setPlaceholderText("substring across indexed fields")
         fbar.addWidget(self.filter_edit)
+        self.unindexed_chk = QCheckBox("Search unindexed")
+        self.unindexed_chk.setToolTip(
+            "Off: quick filter scans only indexed columns (fast). "
+            "On: scans every column (slower).")
+        self.unindexed_chk.stateChanged.connect(self._on_unindexed_toggled)
+        fbar.addWidget(self.unindexed_chk)
         self.rows_lbl = QLabel("")
         fbar.addWidget(self.rows_lbl)
         self.layout.addLayout(fbar)
@@ -316,6 +385,8 @@ class Pane(QWidget):
         # structured filter builder
         self.builder = FilterBuilder()
         self.builder.apply_btn.clicked.connect(self.apply_filters)
+        # Clear must reset AND immediately re-apply the (now empty) filter state.
+        self.builder.clear_btn.clicked.connect(self.apply_filters)
         self.layout.addWidget(self.builder)
 
         # virtual table
@@ -338,6 +409,7 @@ class Pane(QWidget):
         # table loaded after this point.
         self._delegate = TypedCellDelegate(self.model)
         self.grid.setItemDelegate(self._delegate)
+        self._visible_cols = None  # source column names currently shown (None = all)
 
         self.open_btn.clicked.connect(self.on_open)
         self.export_csv.clicked.connect(lambda: self.on_export("csv"))
@@ -346,6 +418,7 @@ class Pane(QWidget):
         self.blob_btn.clicked.connect(self.show_blobs)
         self.sql_btn.clicked.connect(self.show_sql)
         self.cols_btn.clicked.connect(self.show_columns)
+        self.import_btn.clicked.connect(self.on_import)
         self.filter_edit.textChanged.connect(self._on_quick_typed)
 
         self._all_rows = []   # full decoded rows (== self.table.rows)
@@ -391,6 +464,11 @@ class Pane(QWidget):
         self.title.setText(Path(self.path).name)
         self.path_lbl.setText(self.path)
         self.schema_lbl.setText(f"{len(table.columns)} cols · {table.total_rows} rows")
+        self._indexed_cols = self._detect_indexed_columns()
+        self.proxy.set_indexed_columns(self._indexed_cols)
+        self._visible_cols = [c.name for c in table.columns]
+        self.builder.set_fields(self._visible_cols)
+        self._resize_columns_to_header()
         # re-apply any pending quick/structured filters
         self.apply_filters(silent=True)
         self.on_edit_staged(0)
@@ -450,7 +528,8 @@ class Pane(QWidget):
         try:
             info = blob_mod.read_blobs(str(blb))
         except Exception as e:
-            QMessageBox.critical(self, "Blobs", f"Failed to read {blb.name}:\n{e}")
+            QMessageBox.critical(self, "Blob read error",
+                                f"Could not read {blb.name}:\n{e}")
             return
 
         dlg = QDialog(self)
@@ -462,7 +541,10 @@ class Pane(QWidget):
             f"block size {info['block_size']}   ·   {len(info['records'])} records "
             f"(scanned {info['scanned']:,} bytes)")
         header.setStyleSheet("color: #888; font-size: 11px;")
+        header.setWordWrap(True)
         v.addWidget(header)
+        if not info["records"]:
+            v.addWidget(QLabel("No blob records found in this file."))
         list_w = QListWidget()
         for i, rec in enumerate(info["records"]):
             if rec["text"] is not None:
@@ -522,7 +604,7 @@ class Pane(QWidget):
         hint.setStyleSheet("color: #888; font-size: 11px;")
         v.addWidget(hint)
         editor = QTextEdit()
-        editor.setPlainText("SELECT * FROM table WHERE AutoChangePass = True LIMIT 50")
+        editor.setPlainText("")
         editor.setAcceptRichText(False)
         v.addWidget(editor, 1)
         err_lbl = QLabel("")
@@ -603,12 +685,18 @@ class Pane(QWidget):
         v.addLayout(btn_row)
 
         def apply():
+            visible = []
             for c in range(list_w.count()):
                 item = list_w.item(c)
                 show = item.checkState() == Qt.CheckState.Checked
                 # proxy column for this source column
                 pcol = self.proxy.mapFromSource(self.model.index(0, c)).column()
                 self.grid.setColumnHidden(pcol, not show)
+                if show:
+                    visible.append(self.table.columns[c].name)
+            self._visible_cols = visible
+            # refresh the filter builder so hidden fields leave the dropdown/export
+            self.builder.set_fields(visible)
             dlg.accept()
 
         all_btn.clicked.connect(lambda: [list_w.item(i).setCheckState(
@@ -626,17 +714,77 @@ class Pane(QWidget):
             return
         self._open_async(path)
 
+    def on_import(self):
+        """Load a CSV or JSON file and display it as a read-only virtual table.
+
+        Imports are functional in the sense Damion asked for: the data is parsed
+        and shown in the pane's virtual grid (with Quick Filter, compare, column
+        selection and export all working against it). The result has no backing
+        .dat, so it is shown read-only — editing/ saving is disabled, exactly like
+        a SQL query result. This avoids writing a DBISAM .dat from scratch (a
+        separate, riskier milestone) while giving a real, usable import path.
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import table (CSV or JSON)", DEFAULT_DIR,
+            "CSV/JSON (*.csv *.json *.jsonl)")
+        if not path:
+            return
+        try:
+            cols, rows = _import_file(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import failed",
+                                f"Could not read {Path(path).name}:\n{e}")
+            return
+        if not cols:
+            QMessageBox.information(self, "Import", "No columns found in file.")
+            return
+        # Reuse the existing table-shaped structures so the virtual model works.
+        from snitchql.reader import Column, Table
+        table = Table(
+            path=path,
+            columns=[Column(index=i + 1, name=n, type_id=1, length=0, row_offset=0)
+                     for i, n in enumerate(cols)],
+            rows=rows,
+            total_rows=len(rows),
+        )
+        hays = [" ".join("" if v is None else str(v) for v in r.values()).lower()
+                for r in rows]
+        self.path = path
+        self.table = table
+        self._all_rows = rows
+        self._hays = hays
+        self.model.set_table(table, hays)
+        self.model.set_readonly(True)
+        self.proxy.setSourceModel(self.model)
+        self._visible_cols = list(cols)
+        self.builder.set_fields(self._visible_cols)
+        self.title.setText(f"Import ▸ {Path(path).name}")
+        self.path_lbl.setText(path)
+        self.schema_lbl.setText(f"{len(cols)} cols · {len(rows)} rows (imported)")
+        self.unindexed_chk.setChecked(False)  # no indexes on imported data
+        self._indexed_cols = []
+        self.proxy.set_indexed_columns([])
+        self._resize_columns_to_header()
+        self.proxy.set_quick("")
+        self.rows_lbl.setText(f"{self.proxy.rowCount()} shown")
+
+
     def apply_filters(self, silent=False):
         """Push quick + structured filters into the proxy.
 
         The proxy recomputes accepted rows lazily (only visible cells are
         touched), so this is instant even on 400k-row tables.
+
+        The Quick filter defaults to *indexed-only* scanning for speed; the
+        "Search unindexed" tick box flips it to a full-column scan.
         """
         if self.table is None:
             return
         rules, combine = self.builder.collect()
         self.proxy.set_rules(rules, combine=combine)
-        self.proxy.set_quick(self.filter_edit.text())
+        # indexed-only == NOT searching unindexed
+        indexed_only = not self.unindexed_chk.isChecked()
+        self.proxy.set_quick(self.filter_edit.text(), indexed_only=indexed_only)
         self.rows_lbl.setText(f"{self.proxy.rowCount()} shown")
         if not silent:
             self._restore_scroll_top()
@@ -646,6 +794,69 @@ class Pane(QWidget):
 
     def _restore_scroll_top(self):
         self.grid.scrollToTop()
+
+    def _resize_columns_to_header(self):
+        """Size each column so its header label (and typical content) isn't cut off.
+
+        We avoid resizeColumnsToContents() (it would scan every visible cell and
+        stall on 400k-row tables). Instead we set the header's minimum section
+        size from the widest header label, then give each column a sensible width
+        derived from its header text length. Users can still drag to adjust.
+        """
+        hdr = self.grid.horizontalHeader()
+        hdr.setMinimumSectionSize(40)
+        for c in range(self.model.columnCount()):
+            name = self.model.headerData(c, Qt.Orientation.Horizontal,
+                                         Qt.ItemDataRole.DisplayRole) or ""
+            # ~7px per char + padding covers typical DBISAM column names.
+            width = max(60, min(280, len(str(name)) * 8 + 16))
+            self.grid.setColumnWidth(c, width)
+
+    def _detect_indexed_columns(self):
+        """Return the set of column names that have a DBISAM index.
+
+        Scans sibling .idx files (same stem as the .dat) and reads each index
+        definition's key fields, mapping field numbers back to column names. A
+        single-field index points at exactly one column; composite indexes
+        contribute every field they cover. Falls back to an empty set (which the
+        proxy treats as "search everything") if no .idx is present or parsing
+        fails — so a table with no indexes just behaves like the old full scan.
+        """
+        if not self.path:
+            return []
+        from snitchql import idx_writer
+        cols_by_num = {c.index: c.name for c in self.table.columns}
+        indexed = set()
+        base = Path(self.path).with_suffix("")
+        for idx_path in sorted(base.parent.glob(base.name + "*.idx")):
+            try:
+                defs = idx_writer.read_index_defs(idx_path)
+            except Exception:
+                continue
+            for d in defs:
+                for fn in d.field_nums[:d.field_count]:
+                    name = cols_by_num.get(fn)
+                    if name:
+                        indexed.add(name)
+        return sorted(indexed)
+
+    def _on_unindexed_toggled(self, state):
+        """User flipped the 'Search unindexed' box.
+
+        Off (default): quick filter scans only indexed columns (fast). On: full
+        scan, with a one-time warning that it's slower. Re-applies immediately.
+        """
+        on = bool(state)
+        if on:
+            # show the slowdown warning once per pane session
+            if not getattr(self, "_warned_unindexed", False):
+                QMessageBox.information(
+                    self, "Slower search",
+                    "Searching unindexed fields scans every column and is much "
+                    "slower on large tables. Turn this off for everyday use.")
+                self._warned_unindexed = True
+        self.apply_filters(silent=True)
+
 
     def on_export(self, kind):
         if self.table is None:
@@ -657,17 +868,26 @@ class Pane(QWidget):
             f"{kind.upper()} (*.{ext})")
         if not path:
             return
-        # Export the *currently displayed* (filtered) rows. Map each proxy row
-        # back to its source row in self.table.rows.
+        # Export the *currently displayed* (filtered) rows, projected to only the
+        # columns the user has made visible (hidden columns are excluded per spec).
+        visible = self._visible_cols if self._visible_cols is not None else \
+            [c.name for c in self.table.columns]
         rows = []
         for pr in range(self.proxy.rowCount()):
             src = self.proxy.mapToSource(self.proxy.index(pr, 0)).row()
-            rows.append(self._all_rows[src])
+            full = self._all_rows[src]
+            rows.append({k: full.get(k) for k in visible})
+        # Build a lightweight table-shaped view so export_csv/json emit only the
+        # visible columns (and their headers).
+        from snitchql.reader import Column
+        vcols = [Column(index=i, name=n, type_id=next((c.type_id for c in self.table.columns if c.name == n), 1),
+                       length=0, row_offset=0) for i, n in enumerate(visible)]
+        vtable = type("T", (), {"columns": vcols, "rows": rows})()
         with open(path, "w", newline="", encoding="utf-8") as f:
             if kind == "csv":
-                exp.export_csv(self.table, f, rows)
+                exp.export_csv(vtable, f, rows)
             else:
-                exp.export_json(self.table, f, rows)
+                exp.export_json(vtable, f, rows)
         QMessageBox.information(self, "Exported", f"Wrote {len(rows)} rows to {path}")
 
     # ---- edit mode ----
@@ -912,9 +1132,31 @@ class MainWindow(QMainWindow):
             self.compare_btn.setText("Compare ▶")
 
 
+def _app_icon() -> "QIcon | None":
+    """Load the bundled SnitchQL window icon.
+
+    When frozen (PyInstaller) the .ico is collected into the ``assets``
+    subfolder next to the real exe; from source it lives in the repo
+    ``assets`` dir. Returns None if not found so callers can no-op safely.
+    """
+    candidates = []
+    # Bundled-in-build location (handles one-file temp unpack via _app_dir()).
+    candidates.append(_app_dir() / "assets" / "snitchql_app.ico")
+    # Running from source: <repo>/assets next to the snitchql package.
+    candidates.append(Path(__file__).resolve().parent.parent / "assets" / "snitchql_app.ico")
+    for c in candidates:
+        if c.is_file():
+            return QIcon(str(c))
+    return None
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")  # clean cross-platform look
+    # Apply the custom SnitchQL window icon (title bar / taskbar).
+    _ic = _app_icon()
+    if _ic is not None:
+        app.setWindowIcon(_ic)
     # In a frozen windowed build (console=False) any stray print()/traceback
     # would otherwise be lost or, on some setups, trigger a console window.
     # Redirect stdout/stderr to a log file next to the exe so diagnostics are

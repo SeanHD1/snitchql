@@ -26,7 +26,9 @@ a = Analysis(
     [entry],
     pathex=[ROOT],
     binaries=[],
-    datas=[],
+    # Bundle the in-app window icon (assets/snitchql_app.ico) into the build
+    # so gui.py can load it at runtime via QIcon. Exe icon is set on EXE() below.
+    datas=[("assets/snitchql_app.ico", "assets")],
     hiddenimports=[
         "snitchql",
         "snitchql.reader",
@@ -74,4 +76,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=os.path.join(ROOT, "assets", "snitchql_exe.ico"),  # custom SnitchQL exe icon
 )
