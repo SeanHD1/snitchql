@@ -52,6 +52,13 @@ Priority key: **P0** = critical (app hangs/unresponsive), **P1** = high (broken 
 - Quick filter now defaults to indexed-column-only scanning (detected from sibling .idx files via
   idx_writer.read_index_defs); the "Search unindexed" tick box opts into a full-column scan with a
   one-time slowdown warning.
+- Compare: per Damion's note, "block" rows get a font colour equal to the row background so they vanish
+  (background is never painted). The colour is sourced from the grid's resolved QPalette (Base/AlternateBase)
+  so it matches the real rendered background in dark mode (the app's default); model defaults to the dark
+  grid colours so a compare before the first theme push still disappears. "Present" (unique) rows keep
+  normal visible text so they stand out.
+- SnitchQL.log redirect is now lazy (_LazyLog): created only on first real (non-whitespace) write, so a
+  clean run leaves no stray file beside the exe while crashes/tracebacks are still captured.
 - Compare rework: per Damion's note, the row background is NO LONGER painted; instead the font colour is
   tinted with the compare colour (block = dim grey 225,225,230; present = soft pastel) so emphasis is on
   the text, not a filled background.
