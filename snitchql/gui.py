@@ -195,6 +195,42 @@ def _import_file(path: str):
     raise ValueError(f"unsupported import type: {suffix}")
 
 
+class _LazyLog:
+    """File-like stdout/stderr sink that opens its log only on first write.
+
+    Used in frozen windowed builds so a stray print()/traceback is captured
+    without popping a console window — but the file is created lazily, so a
+    clean run leaves no stray log next to the exe.
+    """
+
+    def __init__(self, path):
+        self._path = path
+        self._fh = None
+
+    def write(self, s):
+        # Only materialise the file when there is actual (non-whitespace) output.
+        # Blank / whitespace-only writes (e.g. a stray newline from fmt) stay
+        # silent so a clean run leaves no log behind.
+        if self._fh is None and s and s.strip():
+            try:
+                self._fh = open(self._path, "a", encoding="utf-8", buffering=1)
+            except Exception:
+                return
+        if self._fh is not None:
+            self._fh.write(s)
+
+    def flush(self):
+        if self._fh is not None:
+            self._fh.flush()
+
+    def __getattr__(self, name):
+        # delegate any other attribute (e.g. encoding) to the open file
+        fh = self.__dict__.get("_fh")
+        if fh is not None:
+            return getattr(fh, name)
+        raise AttributeError(name)
+
+
 class CompleterTextEdit(QTextEdit):
     """QTextEdit with word-level autocompletion, for the SQL query box.
 
@@ -1245,6 +1281,10 @@ def main():
     # would otherwise be lost or, on some setups, trigger a console window.
     # Redirect stdout/stderr to a log file next to the exe so diagnostics are
     # captured without a visible terminal. Only active when frozen.
+    #
+    # The file is created *lazily* — the first time anything is actually written
+    # (e.g. a traceback). On a clean run nothing is ever written, so no stray
+    # SnitchQL.log is left next to the exe.
     if getattr(sys, "frozen", False):
         try:
             import ctypes
@@ -1253,12 +1293,10 @@ def main():
             log_path = Path(buf.value).parent / "SnitchQL.log"
         except Exception:
             log_path = Path(sys.executable).parent / "SnitchQL.log"
-        try:
-            _log = open(log_path, "a", encoding="utf-8", buffering=1)
-            sys.stdout = _log
-            sys.stderr = _log
-        except Exception:
-            pass
+
+        _log = _LazyLog(log_path)
+        sys.stdout = _log
+        sys.stderr = _log
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

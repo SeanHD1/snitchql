@@ -12,6 +12,7 @@ Priority key: **P0** = critical (app hangs/unresponsive), **P1** = high (broken 
 
 ## Bugs
 
+- [x] **P2** — `SnitchQL.log` is created next to the exe on every launch, even on a clean run with nothing logged (stdout/stderr redirect opens the file in append mode at startup). Make the log lazily-created: only open/create it the first time something is actually written, so a clean run leaves no stray file while crashes/tracebacks are still captured.
 - [x] **P1** — Compare feature needs to be reworked
 - [x] **P2** — Blob error message header still not appearing correctly
 - [x] **P2** — Clear filter button does not auto-apply; pressing it should immediately re-apply/refresh the (now cleared) filter state
