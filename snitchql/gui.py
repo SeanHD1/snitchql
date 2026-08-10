@@ -258,6 +258,27 @@ class SQLCompleterTextEdit(QTextEdit):
         self._comp.setWidget(self)
         self._comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         self._comp.activated.connect(self._insert_completion)
+        # The popup is a QListView that inherits the app-wide DARK_QSS, which has
+        # no QAbstractItemView rule -> items render with no contrast and the list
+        # can be effectively invisible (you could still Tab/Enter a hidden pick).
+        # Give it its own explicit, high-contrast sheet so it's always readable in
+        # both light and dark app modes. Soft pastel selection (no eye-searing
+        # white), dim-grey base to match Damion's palette preference.
+        popup = self._comp.popup()
+        popup.setStyleSheet(
+            "QListView {"
+            "  background-color: #2b2b2b;"
+            "  color: #e6e6e6;"
+            "  border: 1px solid #555;"
+            "  selection-background-color: #4a6fa5;"
+            "  selection-color: #ffffff;"
+            "  show-decoration-selected: 1;"
+            "}"
+            "QListView::item { padding: 3px 6px; }"
+            "QListView::item:selected {"
+            "  background-color: #4a6fa5; color: #ffffff;"
+            "}")
+        popup.setMinimumHeight(60)
 
     # -- word geometry -----------------------------------------------------
     def _current_word(self):
