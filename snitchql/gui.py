@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QColor, QIcon, QTextCursor, QPalette
 
 from snitchql import query as query_mod
-from snitchql.reader import EDITABLE_TYPES
+from snitchql.reader import EDITABLE_TYPES, read_table_meta
 from snitchql.tablemodel import (
     RowTableModel, RowProxyModel, ReaderThread, TypedCellDelegate,
     _CMP_BLOCK, _CMP_PRESENT,
@@ -259,11 +259,19 @@ class SQLCompleterTextEdit(QTextEdit):
     SEL_BG = QColor("#4a6fa5")         # soft-blue highlight row
     SEL_FG = QColor("#ffffff")         # white highlighted text
 
-    def __init__(self, words, parent=None):
+    def __init__(self, words, parent=None, table_map=None, read_meta=None):
         super().__init__(parent)
         self.setAcceptRichText(False)
         self.setTabChangesFocus(True)   # Tab = move focus when no dropdown
-        self._words = sorted(set(words))
+        # _base_words: the static vocabulary (keywords + table names + any
+        # preloaded table's columns). Column names discovered live from a typed
+        # FROM <table> are merged on top via _refresh_schema_words().
+        self._base_words = sorted(set(words))
+        self._words = list(self._base_words)
+        self._table_map = table_map or {}      # stem -> .dat path
+        self._read_meta = read_meta           # callable(path) -> {columns:[...]} or None
+        self._schema_name = None              # last resolved FROM table
+        self._schema_cols = []                # column names from that table's schema
 
         # Own dropdown (QListWidget) instead of QCompleter.popup().
         # NOTE: use ToolTip (NOT Popup) window flag. Popup makes the window
@@ -290,6 +298,32 @@ class SQLCompleterTextEdit(QTextEdit):
         self._popup.itemClicked.connect(lambda item: self._accept_item(item))
         self._popup.installEventFilter(self)
 
+    # -- live schema columns (FROM <table>) -------------------------------
+    def _refresh_schema_words(self):
+        """If the editor text names a FROM <table> we can resolve, read that
+        table's schema (cheap header-only scan) and merge its column names into
+        the completion vocabulary — so WHERE/SELECT clauses offer real columns
+        without the user having to run the query (or open the table) first.
+        Only re-reads the schema when the resolved table name changes.
+        """
+        if not self._read_meta or not self._table_map:
+            return
+        m = re.search(r"\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)", self.toPlainText(), re.IGNORECASE)
+        name = m.group(1) if m else None
+        if name == self._schema_name:
+            return  # already loaded these columns
+        self._schema_name = name
+        self._schema_cols = []
+        if name and name in self._table_map:
+            try:
+                meta = self._read_meta(self._table_map[name])
+                if meta and meta.get("columns"):
+                    self._schema_cols = [c.name for c in meta["columns"]]
+            except Exception:
+                self._schema_cols = []
+        # rebuild the active vocabulary = base + discovered columns
+        self._words = sorted(set(self._base_words + self._schema_cols))
+
     # -- word geometry -----------------------------------------------------
     def _current_word(self):
         """Return (word_before_cursor, start_offset) for the token under the caret."""
@@ -311,6 +345,7 @@ class SQLCompleterTextEdit(QTextEdit):
 
     # -- dropdown control --------------------------------------------------
     def _update_completions(self):
+        self._refresh_schema_words()   # merge FROM <table> columns if present
         word, _ = self._current_word()
         if len(word) < 1:
             self._popup.hide()
@@ -888,7 +923,8 @@ class Pane(QWidget):
         col_names = [c.name for c in self.table.columns] if self.table else []
         table_names = sorted(table_map.keys())
         editor = SQLCompleterTextEdit(
-            SQL_KEYWORDS + col_names + table_names, parent=dlg)
+            SQL_KEYWORDS + col_names + table_names, parent=dlg,
+            table_map=table_map, read_meta=read_table_meta)
         # Reload the last query so reopening the dialog keeps what you had
         # instead of forcing a full retype. Run and Close both persist it.
         editor.setPlainText(self.last_sql)
