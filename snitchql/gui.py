@@ -21,6 +21,7 @@ Performance note (P0 fix):
   refresh.
 """
 import os
+import re
 import sys
 from pathlib import Path
 from PyQt6.QtCore import QDir, Qt, QSize, QModelIndex, QStandardPaths, QTimer, QEvent
@@ -775,13 +776,80 @@ class Pane(QWidget):
         dlg.exec()
 
     # ---- custom SQL query (Single View only) ----
+    def _sql_data_dir(self):
+        """Directory to scan for queryable .dat tables.
+
+        Prefers the loaded table's folder; otherwise the remembered DEFAULT_DIR.
+        Returns '' if neither is available.
+        """
+        if self.path:
+            d = str(Path(self.path).parent)
+            if Path(d).is_dir():
+                return d
+        return DEFAULT_DIR if DEFAULT_DIR and Path(DEFAULT_DIR).is_dir() else ""
+
+    def _sql_tables(self, data_dir):
+        """Map of table-name (stem) -> full .dat path for every .dat in data_dir."""
+        table_map = {}
+        if data_dir and Path(data_dir).is_dir():
+            for p in sorted(Path(data_dir).glob("*.dat")):
+                table_map[p.stem] = str(p)
+        return table_map
+
+    def _sql_from_table(self, sql):
+        """Extract the table name after FROM (case-insensitive), or '' if absent."""
+        m = re.search(r"\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)", sql, re.IGNORECASE)
+        return m.group(1) if m else ""
+
+    def _sql_resolve_table(self, name, table_map):
+        """Resolve a FROM name to a .dat path. Falls back to the loaded table."""
+        if name and name in table_map:
+            return table_map[name]
+        if self.table is not None and self.path:
+            return self.path
+        return None
+
+    def _build_pane_from_table(self, table):
+        """Synchronously load a decoded ``Table`` into this pane (mirrors the
+        async ``_on_loaded`` path, minus the QThread/supersede handling). Sets the
+        grid model, haystack (for Quick Filter / compare), indexed-column tracking
+        and column widths so the pane behaves exactly as if the table were opened.
+        """
+        hays = []
+        for r in table.rows:
+            hays.append(" ".join(str(v) for v in r.values()).lower())
+        self._hays = hays
+        self.table = table
+        self._all_rows = table.rows
+        self.model.set_table(table, hays)
+        self.proxy.setSourceModel(self.model)
+        self.builder.set_fields([c.name for c in table.columns])
+        self.title.setText(Path(self.path).name)
+        self.path_lbl.setText(self.path)
+        self.schema_lbl.setText(
+            f"{len(table.columns)} cols · {table.total_rows} rows")
+        self._indexed_cols = self._detect_indexed_columns()
+        self.proxy.set_indexed_columns(self._indexed_cols)
+        self._visible_cols = [c.name for c in table.columns]
+        self.builder.set_fields(self._visible_cols)
+        self._resize_columns_to_header()
+        self.apply_filters(silent=True)
+        self.on_edit_staged(0)
+
     def show_sql(self):
-        """Open a SQL query dialog. Runs against the loaded pane (read-only).
+        """Open a SQL query dialog. Runs over a table in the data dir (read-only).
+
+        You do NOT need to pre-open a table: the dialog scans the data directory
+        (the loaded table's folder, or the remembered Data Dir) for every .dat and
+        offers those table names in the autocomplete, so a query like
+        ``SELECT * FROM staff WHERE …`` works against a table you haven't opened.
+
+        On Run the chosen table is loaded into the pane (as if you'd opened it),
+        then the query result is overlaid.
 
         Per spec this is a Single View feature: if the app is in Dual layout the
-        user is told to switch to Single first, since results occupy the whole
-        pane.  The query runs over the already-decoded rows via the safe,
-        non-executing parser in ``snitchql.sql`` — no eval, no filesystem.
+        user is told to switch to Single first. The query runs over decoded rows
+        via the safe, non-executing parser in ``snitchql.sql`` — no eval, no FS.
         """
         mw = self.window()
         if mw is not None and hasattr(mw, "layout_btn") and mw.layout_btn.isChecked():
@@ -790,28 +858,37 @@ class Pane(QWidget):
                 "Custom SQL runs in Single View. Turn off 'Layout: Dual' first "
                 "(top toolbar) so the result can fill this pane.")
             return
-        if self.table is None:
-            QMessageBox.information(self, "SQL", "Open a .dat first.")
+
+        data_dir = self._sql_data_dir()
+        if not data_dir:
+            QMessageBox.information(
+                self, "SQL",
+                "Set a Data Dir first (toolbar 'Set Data Dir…') or open a .dat, "
+                "so SnitchQL knows which tables are available to query.")
             return
 
+        table_map = self._sql_tables(data_dir)
+
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"SQL Query — {Path(self.path or 'table').name}")
+        dlg.setWindowTitle(f"SQL Query — {Path(data_dir).name}")
         dlg.resize(620, 360)
         v = QVBoxLayout(dlg)
-        hint = QLabel("SELECT * FROM table  [WHERE …]  [ORDER BY col ASC|DESC]  [LIMIT n]\n"
-                      "Ops: = != <> > < >= <=  LIKE   Logic: AND OR ( )")
+        hint = QLabel("SELECT * FROM <table>  [WHERE …]  [ORDER BY col ASC|DESC]  [LIMIT n]\n"
+                      "Ops: = != <> > < >= <=  LIKE   Logic: AND OR ( )\n"
+                      f"Tables in {Path(data_dir).name}: {', '.join(sorted(table_map)) or '(none found)'}")
         hint.setStyleSheet("color: #888; font-size: 11px;")
         v.addWidget(hint)
         # Autocomplete vocabulary: ONLY what the mini engine (sql.py) actually
-        # parses, plus this table's live column names. Suggesting unsupported
-        # keywords would let the user pick a word that then 500s at Run time.
+        # parses, plus this table's live column names (if one is loaded), plus the
+        # table names available in the data dir (so you can query without opening).
         SQL_KEYWORDS = [
             "SELECT", "FROM", "WHERE", "AND", "OR",
             "ORDER", "BY", "ASC", "DESC", "LIMIT",
         ]
-        ALIAS = ["table"]  # FROM <table> is the accepted alias; engine ignores it
         col_names = [c.name for c in self.table.columns] if self.table else []
-        editor = SQLCompleterTextEdit(SQL_KEYWORDS + col_names + ALIAS, parent=dlg)
+        table_names = sorted(table_map.keys())
+        editor = SQLCompleterTextEdit(
+            SQL_KEYWORDS + col_names + table_names, parent=dlg)
         # Reload the last query so reopening the dialog keeps what you had
         # instead of forcing a full retype. Run and Close both persist it.
         editor.setPlainText(self.last_sql)
@@ -834,6 +911,25 @@ class Pane(QWidget):
             sql = editor.toPlainText().strip()
             if not sql:
                 return
+            # Resolve which .dat the query targets.
+            name = self._sql_from_table(sql)
+            target = self._sql_resolve_table(name, table_map)
+            if target is None:
+                err_lbl.setText(
+                    f"Could not resolve table '{name}' — available: "
+                    f"{', '.join(sorted(table_map)) or '(none in data dir)'}")
+                return
+            # Load the target table into the pane if it isn't already the loaded
+            # one (so the pane 'is' that table, exactly like opening it).
+            if self.path != target or self.table is None:
+                try:
+                    from snitchql.reader import read_table
+                    t = read_table(target)
+                except Exception as e:
+                    err_lbl.setText(f"Failed to read {Path(target).name}: {e}")
+                    return
+                self.path = target
+                self._build_pane_from_table(t)
             try:
                 result = run_query(self.table.columns, self._all_rows, sql)
             except SqlError as e:
@@ -842,7 +938,7 @@ class Pane(QWidget):
             err_lbl.setText("")
             # persist the query so reopening the dialog reloads it (no retyping)
             self.last_sql = sql
-            # load the result as a read-only table in this pane
+            # overlay the query result as a read-only table in this pane
             self.title.setText(f"SQL ▸ {Path(self.path or 'table').name}")
             self.schema_lbl.setText(
                 f"{len(result.columns)} cols · {result.total_rows} rows")
