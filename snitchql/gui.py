@@ -533,6 +533,7 @@ class Pane(QWidget):
         super().__init__(parent)
         self.table = None
         self.path = None
+        self.last_sql = ""   # last SQL query typed/run, reloaded when SQL dialog reopens
         self.layout = QVBoxLayout(self)
 
         # toolbar
@@ -811,7 +812,9 @@ class Pane(QWidget):
         ALIAS = ["table"]  # FROM <table> is the accepted alias; engine ignores it
         col_names = [c.name for c in self.table.columns] if self.table else []
         editor = SQLCompleterTextEdit(SQL_KEYWORDS + col_names + ALIAS, parent=dlg)
-        editor.setPlainText("")
+        # Reload the last query so reopening the dialog keeps what you had
+        # instead of forcing a full retype. Run and Close both persist it.
+        editor.setPlainText(self.last_sql)
         editor.setAcceptRichText(False)
         v.addWidget(editor, 1)
         err_lbl = QLabel("")
@@ -837,6 +840,8 @@ class Pane(QWidget):
                 err_lbl.setText(f"SQL error: {e}")
                 return
             err_lbl.setText("")
+            # persist the query so reopening the dialog reloads it (no retyping)
+            self.last_sql = sql
             # load the result as a read-only table in this pane
             self.title.setText(f"SQL ▸ {Path(self.path or 'table').name}")
             self.schema_lbl.setText(
@@ -850,8 +855,13 @@ class Pane(QWidget):
             self.rows_lbl.setText(f"{self.proxy.rowCount()} shown")
             dlg.accept()
 
+        def on_close():
+            # save whatever is currently typed, even if not run, then close
+            self.last_sql = editor.toPlainText().strip()
+            dlg.reject()
+
         run_btn.clicked.connect(on_run)
-        close_btn.clicked.connect(dlg.reject)
+        close_btn.clicked.connect(on_close)
         # Put keyboard focus on the editor as soon as the modal dialog is up, so
         # the first keystroke goes to the SQL box (not a button). Without this,
         # on a live session the QTextEdit can fail to grab focus and typing does
