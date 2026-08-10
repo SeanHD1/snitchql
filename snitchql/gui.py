@@ -23,7 +23,7 @@ Performance note (P0 fix):
 import os
 import sys
 from pathlib import Path
-from PyQt6.QtCore import QDir, Qt, QSize, QModelIndex, QStandardPaths
+from PyQt6.QtCore import QDir, Qt, QSize, QModelIndex, QStandardPaths, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QLineEdit, QLabel, QComboBox, QMessageBox,
@@ -769,6 +769,8 @@ class Pane(QWidget):
         btn_row = QHBoxLayout()
         run_btn = QPushButton("Run")
         close_btn = QPushButton("Close")
+        run_btn.setAutoDefault(False)      # don't hijack Enter/typing in the dialog
+        close_btn.setAutoDefault(False)
         btn_row.addStretch(1)
         btn_row.addWidget(run_btn)
         btn_row.addWidget(close_btn)
@@ -799,6 +801,11 @@ class Pane(QWidget):
 
         run_btn.clicked.connect(on_run)
         close_btn.clicked.connect(dlg.reject)
+        # Put keyboard focus on the editor as soon as the modal dialog is up, so
+        # the first keystroke goes to the SQL box (not a button). Without this,
+        # on a live session the QTextEdit can fail to grab focus and typing does
+        # nothing — which made autocomplete appear dead.
+        QTimer.singleShot(0, editor.setFocus)
         dlg.exec()
 
     # ---- column / field visibility ----
