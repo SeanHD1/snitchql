@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QTextEdit, QTableView, QTableWidget, QTableWidgetItem,
     QListWidgetItem, QCheckBox, QCompleter,
 )
-from PyQt6.QtGui import QColor, QIcon
+from PyQt6.QtGui import QColor, QIcon, QTextCursor
 
 from snitchql import query as query_mod
 from snitchql.reader import EDITABLE_TYPES
@@ -231,24 +231,35 @@ class _LazyLog:
         raise AttributeError(name)
 
 
-class CompleterTextEdit(QTextEdit):
-    """QTextEdit with word-level autocompletion, for the SQL query box.
+class SQLCompleterTextEdit(QTextEdit):
+    """QTextEdit with IDE-style word autocompletion, for the SQL query box.
 
-    QTextEdit has no native QCompleter support, so we drive it through an event
-    filter: pressing Tab (or Ctrl+Space) pops a list of matching words culled
-    from the SQL keyword set plus the current table's columns. Enter/Tab while
-    the popup is open accepts the highlighted completion.
+    QTextEdit has no native QCompleter support, so we drive a QCompleter
+    manually:
+
+      * As you TYPE (any alnum/``_`` run) the popup auto-filters to the word
+        under the caret — like an editor, you never need a magic key.
+      * Ctrl+Space forces the list open even on an empty word.
+      * When the popup is open: Tab / Enter / Return accepts the highlighted
+        completion, Up/Down moves the highlight, Esc dismisses it.
+      * Tab with the popup CLOSED moves focus (setTabChangesFocus), so the
+        query box behaves like a normal field instead of inserting a tab char.
+
+    The vocabulary is curated to exactly what ``sql.py`` (the mini engine)
+    actually parses, so a suggestion never produces a SqlError at run time.
     """
 
     def __init__(self, words, parent=None):
         super().__init__(parent)
         self.setAcceptRichText(False)
+        self.setTabChangesFocus(True)  # Tab = move focus when no popup
         self._comp = QCompleter(sorted(set(words)), self)
         self._comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self._comp.setWidget(self)
         self._comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         self._comp.activated.connect(self._insert_completion)
 
+    # -- word geometry -----------------------------------------------------
     def _current_word(self):
         """Return (word_before_cursor, start_offset) for the token under the caret."""
         cur = self.textCursor()
@@ -263,11 +274,12 @@ class CompleterTextEdit(QTextEdit):
         cur = self.textCursor()
         word, start = self._current_word()
         cur.setPosition(start)
-        cur.setPosition(start + len(word), Qt.TextCursor.MoveMode.KeepAnchor)
+        cur.setPosition(start + len(word), QTextCursor.MoveMode.KeepAnchor)
         cur.insertText(completion)
         self.setTextCursor(cur)
 
-    def _show_completions(self):
+    # -- popup control -----------------------------------------------------
+    def _update_completions(self):
         word, _ = self._current_word()
         if len(word) < 1:
             self._comp.popup().hide()
@@ -278,17 +290,56 @@ class CompleterTextEdit(QTextEdit):
             return
         self._comp.complete(self.cursorRect())
 
+    def _accept_current(self):
+        popup = self._comp.popup()
+        idx = popup.currentIndex()
+        model = self._comp.completionModel()
+        if not idx.isValid() and model.rowCount() > 0:
+            idx = model.index(0, 0)
+        if idx.isValid():
+            self._insert_completion(model.data(idx))
+        popup.hide()
+
+    def _move_highlight(self, delta):
+        popup = self._comp.popup()
+        model = self._comp.completionModel()
+        cur = popup.currentIndex()
+        row = cur.row() + delta
+        if 0 <= row < model.rowCount():
+            popup.setCurrentIndex(model.index(row, 0))
+
+    # -- key handling ------------------------------------------------------
     def keyPressEvent(self, e):
-        if self._comp.popup().isVisible():
+        popup = self._comp.popup()
+        # 1) If the popup is open, intercept the navigation/accept keys so the
+        #    QTextEdit never sees them (no stray newlines/tabs/characters).
+        if popup.isVisible():
             if e.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Enter, Qt.Key.Key_Return):
-                e.ignore()  # let the completer insert the highlighted completion
+                self._accept_current()
+                e.accept()
                 return
+            if e.key() == Qt.Key.Key_Escape:
+                popup.hide()
+                e.accept()
+                return
+            if e.key() == Qt.Key.Key_Down:
+                self._move_highlight(1)
+                e.accept()
+                return
+            if e.key() == Qt.Key.Key_Up:
+                self._move_highlight(-1)
+                e.accept()
+                return
+
+        # 2) Normal handling (typing, newline, backspace, focus traversal...).
         super().keyPressEvent(e)
+
+        # 3) Re-evaluate the popup after the document changed.
         ctrl = e.modifiers() & Qt.KeyboardModifier.ControlModifier
         if ctrl and e.key() == Qt.Key.Key_Space:
-            self._show_completions()
-        elif e.key() == Qt.Key.Key_Tab and not self._comp.popup().isVisible():
-            self._show_completions()
+            self._update_completions()
+        elif (e.key() == Qt.Key.Key_Backspace) or (e.text() and not ctrl):
+            self._update_completions()
 
 
 # Light-mode QSS. Soft light-green alternating rows (no eye-searing blue), and a
@@ -699,14 +750,16 @@ class Pane(QWidget):
                       "Ops: = != <> > < >= <=  LIKE   Logic: AND OR ( )")
         hint.setStyleSheet("color: #888; font-size: 11px;")
         v.addWidget(hint)
-        # Autocomplete vocabulary: SQL keywords + this table's column names.
+        # Autocomplete vocabulary: ONLY what the mini engine (sql.py) actually
+        # parses, plus this table's live column names. Suggesting unsupported
+        # keywords would let the user pick a word that then 500s at Run time.
         SQL_KEYWORDS = [
-            "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "LIKE", "IN",
-            "ORDER", "BY", "ASC", "DESC", "LIMIT", "OFFSET", "AS", "DISTINCT",
-            "NULL", "IS", "BETWEEN", "GROUP", "HAVING",
+            "SELECT", "FROM", "WHERE", "AND", "OR",
+            "ORDER", "BY", "ASC", "DESC", "LIMIT",
         ]
+        ALIAS = ["table"]  # FROM <table> is the accepted alias; engine ignores it
         col_names = [c.name for c in self.table.columns] if self.table else []
-        editor = CompleterTextEdit(SQL_KEYWORDS + col_names + ["table"], parent=dlg)
+        editor = SQLCompleterTextEdit(SQL_KEYWORDS + col_names + ALIAS, parent=dlg)
         editor.setPlainText("")
         editor.setAcceptRichText(False)
         v.addWidget(editor, 1)
