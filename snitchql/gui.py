@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QTextEdit, QTableView, QTableWidget, QTableWidgetItem,
     QListWidgetItem, QCheckBox, QCompleter,
 )
-from PyQt6.QtGui import QColor, QIcon, QTextCursor
+from PyQt6.QtGui import QColor, QIcon, QTextCursor, QPalette
 
 from snitchql import query as query_mod
 from snitchql.reader import EDITABLE_TYPES
@@ -261,23 +261,36 @@ class SQLCompleterTextEdit(QTextEdit):
         # The popup is a QListView that inherits the app-wide DARK_QSS, which has
         # no QAbstractItemView rule -> items render with no contrast and the list
         # can be effectively invisible (you could still Tab/Enter a hidden pick).
-        # Give it its own explicit, high-contrast sheet so it's always readable in
-        # both light and dark app modes. Soft pastel selection (no eye-searing
-        # white), dim-grey base to match Damion's palette preference.
+        # Two layers of defence so the option TEXT is always visible:
+        #   1) A QSS that colors the items themselves (not just the view bg), and
+        #   2) A hard QPalette fallback, because the dark app stylesheet can win
+        #      over CSS `color` on the delegate in some Qt builds.
         popup = self._comp.popup()
         popup.setStyleSheet(
             "QListView {"
             "  background-color: #2b2b2b;"
-            "  color: #e6e6e6;"
             "  border: 1px solid #555;"
             "  selection-background-color: #4a6fa5;"
             "  selection-color: #ffffff;"
             "  show-decoration-selected: 1;"
             "}"
-            "QListView::item { padding: 3px 6px; }"
+            "QListView::item { color: #e6e6e6; padding: 3px 6px; }"
             "QListView::item:selected {"
             "  background-color: #4a6fa5; color: #ffffff;"
             "}")
+        # Palette fallback: set the item text/selection colors directly so they
+        # survive any CSS precedence fight with the app-wide dark stylesheet.
+        pal = popup.palette()
+        LIGHT = QColor("#e6e6e6")   # normal item text (light grey on dark)
+        SELBG = QColor("#4a6fa5")   # selected row bg (soft blue)
+        SELFG = QColor("#ffffff")   # selected row text (white)
+        pal.setColor(QPalette.ColorRole.Text, LIGHT)
+        pal.setColor(QPalette.ColorRole.WindowText, LIGHT)
+        pal.setColor(QPalette.ColorRole.Base, QColor("#2b2b2b"))
+        pal.setColor(QPalette.ColorRole.Window, QColor("#2b2b2b"))
+        pal.setColor(QPalette.ColorRole.Highlight, SELBG)
+        pal.setColor(QPalette.ColorRole.HighlightedText, SELFG)
+        popup.setPalette(pal)
         popup.setMinimumHeight(60)
 
     # -- word geometry -----------------------------------------------------
