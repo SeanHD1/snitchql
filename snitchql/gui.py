@@ -23,7 +23,7 @@ Performance note (P0 fix):
 import os
 import sys
 from pathlib import Path
-from PyQt6.QtCore import QDir, Qt, QSize, QModelIndex, QStandardPaths, QTimer
+from PyQt6.QtCore import QDir, Qt, QSize, QModelIndex, QStandardPaths, QTimer, QEvent
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QLineEdit, QLabel, QComboBox, QMessageBox,
@@ -234,64 +234,55 @@ class _LazyLog:
 class SQLCompleterTextEdit(QTextEdit):
     """QTextEdit with IDE-style word autocompletion, for the SQL query box.
 
-    QTextEdit has no native QCompleter support, so we drive a QCompleter
-    manually:
+    QTextEdit has no native QCompleter support, and the built-in QCompleter
+    popup (a QListView) inherited the app's DARK_QSS and refused to render item
+    text on several machines — so we drive our OWN QListWidget dropdown. Every
+    candidate is a QListWidgetItem whose foreground colour is set explicitly via
+    setForeground(), which the app-wide stylesheet cannot override. That makes
+    the option text reliably visible in both light and dark app modes.
 
-      * As you TYPE (any alnum/``_`` run) the popup auto-filters to the word
-        under the caret — like an editor, you never need a magic key.
+      * As you TYPE (any alnum/_ run) the dropdown auto-filters to the word under
+        the caret — no magic key needed.
       * Ctrl+Space forces the list open even on an empty word.
-      * When the popup is open: Tab / Enter / Return accepts the highlighted
-        completion, Up/Down moves the highlight, Esc dismisses it.
-      * Tab with the popup CLOSED moves focus (setTabChangesFocus), so the
-        query box behaves like a normal field instead of inserting a tab char.
+      * When open: Tab / Enter / Return accepts the highlighted completion,
+        Up/Down moves the highlight, Esc dismisses it.
+      * Tab with the dropdown CLOSED moves focus (setTabChangesFocus).
 
     The vocabulary is curated to exactly what ``sql.py`` (the mini engine)
     actually parses, so a suggestion never produces a SqlError at run time.
     """
 
+    # Item colours (explicit, set per-item so the app QSS can't wash them out).
+    ITEM_TEXT = QColor("#f0f0f0")      # light grey text on dark popup
+    ITEM_BG = QColor("#2b2b2b")        # dark popup background
+    SEL_BG = QColor("#4a6fa5")         # soft-blue highlight row
+    SEL_FG = QColor("#ffffff")         # white highlighted text
+
     def __init__(self, words, parent=None):
         super().__init__(parent)
         self.setAcceptRichText(False)
-        self.setTabChangesFocus(True)  # Tab = move focus when no popup
-        self._comp = QCompleter(sorted(set(words)), self)
-        self._comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self._comp.setWidget(self)
-        self._comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
-        self._comp.activated.connect(self._insert_completion)
-        # The popup is a QListView that inherits the app-wide DARK_QSS, which has
-        # no QAbstractItemView rule -> items render with no contrast and the list
-        # can be effectively invisible (you could still Tab/Enter a hidden pick).
-        # Two layers of defence so the option TEXT is always visible:
-        #   1) A QSS that colors the items themselves (not just the view bg), and
-        #   2) A hard QPalette fallback, because the dark app stylesheet can win
-        #      over CSS `color` on the delegate in some Qt builds.
-        popup = self._comp.popup()
-        popup.setStyleSheet(
-            "QListView {"
+        self.setTabChangesFocus(True)   # Tab = move focus when no dropdown
+        self._words = sorted(set(words))
+
+        # Own dropdown (QListWidget) instead of QCompleter.popup().
+        self._popup = QListWidget(self)
+        self._popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self._popup.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._popup.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self._popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._popup.setMinimumHeight(60)
+        # Visible container + explicit item text colour.
+        self._popup.setStyleSheet(
+            "QListWidget {"
             "  background-color: #2b2b2b;"
             "  border: 1px solid #555;"
-            "  selection-background-color: #4a6fa5;"
-            "  selection-color: #ffffff;"
-            "  show-decoration-selected: 1;"
             "}"
-            "QListView::item { color: #e6e6e6; padding: 3px 6px; }"
-            "QListView::item:selected {"
+            "QListWidget::item { padding: 3px 6px; }"
+            "QListWidget::item:selected {"
             "  background-color: #4a6fa5; color: #ffffff;"
             "}")
-        # Palette fallback: set the item text/selection colors directly so they
-        # survive any CSS precedence fight with the app-wide dark stylesheet.
-        pal = popup.palette()
-        LIGHT = QColor("#e6e6e6")   # normal item text (light grey on dark)
-        SELBG = QColor("#4a6fa5")   # selected row bg (soft blue)
-        SELFG = QColor("#ffffff")   # selected row text (white)
-        pal.setColor(QPalette.ColorRole.Text, LIGHT)
-        pal.setColor(QPalette.ColorRole.WindowText, LIGHT)
-        pal.setColor(QPalette.ColorRole.Base, QColor("#2b2b2b"))
-        pal.setColor(QPalette.ColorRole.Window, QColor("#2b2b2b"))
-        pal.setColor(QPalette.ColorRole.Highlight, SELBG)
-        pal.setColor(QPalette.ColorRole.HighlightedText, SELFG)
-        popup.setPalette(pal)
-        popup.setMinimumHeight(60)
+        self._popup.itemClicked.connect(lambda item: self._accept_item(item))
+        self._popup.installEventFilter(self)
 
     # -- word geometry -----------------------------------------------------
     def _current_word(self):
@@ -312,48 +303,68 @@ class SQLCompleterTextEdit(QTextEdit):
         cur.insertText(completion)
         self.setTextCursor(cur)
 
-    # -- popup control -----------------------------------------------------
+    # -- dropdown control --------------------------------------------------
     def _update_completions(self):
         word, _ = self._current_word()
         if len(word) < 1:
-            self._comp.popup().hide()
+            self._popup.hide()
             return
-        self._comp.setCompletionPrefix(word)
-        if self._comp.completionCount() == 0:
-            self._comp.popup().hide()
+        matches = [w for w in self._words if w.lower().startswith(word.lower())]
+        if not matches:
+            self._popup.hide()
             return
-        self._comp.complete(self.cursorRect())
+        self._popup.clear()
+        for w in matches:
+            it = QListWidgetItem(w)
+            it.setForeground(self.ITEM_TEXT)      # per-item colour: survives QSS
+            self._popup.addItem(it)
+        self._popup.setCurrentRow(0)
+        self._popup.setVisible(True)
+        # Size & position the dropdown right under the caret. Use a fixed per-row
+        # height estimate (sizeHintForRow is 0 before the widget is laid out, e.g.
+        # under the offscreen QPA), so the list always has a usable height.
+        fm = self._popup.fontMetrics()
+        row_h = fm.height() + 8
+        h = min(row_h * len(matches) + 8, 240)
+        w = max(180, self.width() // 2)
+        self._popup.setFixedSize(w, max(h, self._popup.minimumHeight()))
+        rect = self.cursorRect()
+        pos = self.mapToGlobal(rect.bottomLeft())
+        self._popup.move(pos)
+
+    def _accept_item(self, item):
+        if item is not None:
+            self._insert_completion(item.text())
+        self._popup.hide()
 
     def _accept_current(self):
-        popup = self._comp.popup()
-        idx = popup.currentIndex()
-        model = self._comp.completionModel()
-        if not idx.isValid() and model.rowCount() > 0:
-            idx = model.index(0, 0)
-        if idx.isValid():
-            self._insert_completion(model.data(idx))
-        popup.hide()
+        item = self._popup.currentItem()
+        self._accept_item(item)
 
     def _move_highlight(self, delta):
-        popup = self._comp.popup()
-        model = self._comp.completionModel()
-        cur = popup.currentIndex()
-        row = cur.row() + delta
-        if 0 <= row < model.rowCount():
-            popup.setCurrentIndex(model.index(row, 0))
+        row = self._popup.currentRow() + delta
+        if 0 <= row < self._popup.count():
+            self._popup.setCurrentRow(row)
+
+    # -- event filter: let the dropdown swallow its own nav keys -----------
+    def eventFilter(self, obj, e):
+        if obj is self._popup and e.type() == QEvent.Type.KeyPress:
+            if e.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down,
+                           Qt.Key.Key_Tab, Qt.Key.Key_Enter, Qt.Key.Key_Return,
+                           Qt.Key.Key_Escape):
+                self.keyPressEvent(e)
+                return True
+        return super().eventFilter(obj, e)
 
     # -- key handling ------------------------------------------------------
     def keyPressEvent(self, e):
-        popup = self._comp.popup()
-        # 1) If the popup is open, intercept the navigation/accept keys so the
-        #    QTextEdit never sees them (no stray newlines/tabs/characters).
-        if popup.isVisible():
+        if self._popup.isVisible():
             if e.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Enter, Qt.Key.Key_Return):
                 self._accept_current()
                 e.accept()
                 return
             if e.key() == Qt.Key.Key_Escape:
-                popup.hide()
+                self._popup.hide()
                 e.accept()
                 return
             if e.key() == Qt.Key.Key_Down:
@@ -368,12 +379,13 @@ class SQLCompleterTextEdit(QTextEdit):
         # 2) Normal handling (typing, newline, backspace, focus traversal...).
         super().keyPressEvent(e)
 
-        # 3) Re-evaluate the popup after the document changed.
+        # 3) Re-evaluate the dropdown after the document changed.
         ctrl = e.modifiers() & Qt.KeyboardModifier.ControlModifier
         if ctrl and e.key() == Qt.Key.Key_Space:
             self._update_completions()
         elif (e.key() == Qt.Key.Key_Backspace) or (e.text() and not ctrl):
             self._update_completions()
+
 
 
 # Light-mode QSS. Soft light-green alternating rows (no eye-searing blue), and a
