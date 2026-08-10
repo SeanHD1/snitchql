@@ -265,8 +265,13 @@ class SQLCompleterTextEdit(QTextEdit):
         self._words = sorted(set(words))
 
         # Own dropdown (QListWidget) instead of QCompleter.popup().
+        # NOTE: use ToolTip (NOT Popup) window flag. Popup makes the window
+        # modal and grabs ALL keyboard input until dismissed, which prevented
+        # typing while the list was open. ToolTip is a non-modal floating window
+        # that never steals focus, so the editor keeps receiving keystrokes and
+        # the list simply re-filters as you type.
         self._popup = QListWidget(self)
-        self._popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self._popup.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
         self._popup.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._popup.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._popup.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
